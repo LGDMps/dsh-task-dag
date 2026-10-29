@@ -2,6 +2,7 @@
   "name": "dsh-task-dag",
   "version": "0.2.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Project task DAG for the DSH Web GUI: five-state task nodes, precondition conditions, per-node agent presets/models, per-node schedules and an ordered chain of chat sessions.",
   "exports": {
