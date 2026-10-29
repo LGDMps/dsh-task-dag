@@ -2,7 +2,7 @@
  * Unit tests for the session adapters.
  *
  * Everything is a fake `ctx`: no DSH process, no session files on disk. The
- * gateway shapes mirror the verified calls in design/api-host.md §7.
+ * gateway shapes mirror the verified calls (DSH 0.2.1-rc.3).
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

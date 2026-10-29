@@ -7,7 +7,7 @@
  * handoff brief lives, because that brief is the only thing that survives a
  * context compression.
  *
- * Gateway call shapes (verified against DSH 0.2.1-rc.3, see design/api-host.md §7):
+ * Gateway call shapes (verified against DSH 0.2.1-rc.3):
  *   invoke({namespace, method, args}) with args = {request: {...}},
  *   except `session/list`, which takes {_request: {}}.
  *   stream({namespace:'session', method:'follow', args:{request:{...}}}).

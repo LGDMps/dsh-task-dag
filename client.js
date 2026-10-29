@@ -10,7 +10,7 @@
  * text drafts before the selection moves. The Host half owns the graph file;
  * this file only renders the snapshot and posts actions back to it.
  *
- * Platform facts this file depends on (see design/api-client.md):
+ * Platform facts this file depends on (verified against DSH 0.2.1-rc.3):
  *   - loaded as one self-contained module by `window.__ModuleLoader__.load`;
  *   - only `react` is required (no JSX, no bundler, no Harness packages);
  *   - the whole `apply` body is wrapped in try/catch: a throwing client apply

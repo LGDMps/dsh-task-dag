@@ -4,7 +4,7 @@
  * These tests mount the real plugin (`apply()`) against a fake Cordis context,
  * then drive it over a real loopback HTTP server exactly as the browser half
  * does. They are not unit tests: every assertion is about the observable
- * contract from `design/20-business-logic.md` — five statuses, condition-based
+ * contract described in the README — five statuses, condition-based
  * prerequisites, failed-node rules, per-node Agent preset/model, per-node
  * scheduling, the project milestone, deletion splicing, CAS/SSE, and the Agent
  * tools sharing the same graph as HTTP.
