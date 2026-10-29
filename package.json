@@ -1,0 +1,49 @@
+{
+  "name": "dsh-task-dag",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Project task DAG for the DSH Web GUI: five-state task nodes, precondition conditions, per-node agent presets/models, per-node schedules and an ordered chain of chat sessions.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-api-workspace-controller"
+      ]
+    }
+  },
+  "devDependencies": {
+    "jsdom": "^25.0.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "scheduler": "0.23.2"
+  },
+  "scripts": {
+    "test": "node test/model.test.js && node test/store.test.js && node test/ops.test.js && node test/sessions.test.js && node test/services.test.js && node test/description.test.js && node test/scheduler.test.js && node test/routes.test.js && node test/client.syntax.test.js && node test/client.routing.test.js && node test/client.mount.test.js && node test/acceptance.integration.test.js"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Task DAG",
+    "description": "Project task graph: five-state task nodes, editable precondition conditions, per-node execution settings and schedules, and an ordered chain of chat sessions."
+  }
+}

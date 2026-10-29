@@ -1,0 +1,22 @@
+# Runtime data written by the plugin into a project directory
+.dsh-task-graph/
+
+# Local development dependencies (React + jsdom) for test/client.mount.test.js
+node_modules/
+.pnpm-store/
+
+# Internal design and research notes (machine-specific paths, host internals);
+# kept local, not part of the published plugin.
+design/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log

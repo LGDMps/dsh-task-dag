@@ -1,0 +1,11 @@
+# dsh-task-dag bundle patch: inserts the dual-face plugin row into the profile
+# roster. Applied as a profile bundle layer (the `dsh.bundle.patch` manifest
+# field) over the shipped layers.
+#
+# The row is a bare plugin addressed by package name: the Host half
+# (`exports "."`) serves the graph store, the HTTP/SSE API and the Agent tools;
+# the `dsh.client` declaration in package.json makes the browser half
+# (`exports "./client"`) load in the web GUI.
+- insert:
+    - id: task-dag
+      name: dsh-task-dag
