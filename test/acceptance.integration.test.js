@@ -648,6 +648,53 @@ test('v2 acceptance: HTTP + tools + prompt on a clean workspace', async (t) => {
     assert.equal('milestoneDone' in summary.progress, false)
   })
 
+  await t.test('节点组合可创建、改名、移动成员、删除，并在快照中原样读回', async () => {
+    let snapshot = await act(env, 'add-node', { title: '组合甲' })
+    const ga = nodeByTitle(snapshot.graph, '组合甲')
+    snapshot = await act(env, 'add-node', { title: '组合乙' })
+    const gb = nodeByTitle(snapshot.graph, '组合乙')
+    snapshot = await act(env, 'add-node', { title: '组合丙' })
+    const gc = nodeByTitle(snapshot.graph, '组合丙')
+    assert.deepEqual(snapshot.graph.groups, [], 'a graph written before groups existed reads as []')
+
+    snapshot = await act(env, 'create-group', { name: '  前端  ', nodeIds: [ga.id, gb.id] })
+    assert.equal(snapshot.graph.groups.length, 1)
+    const group = snapshot.graph.groups[0]
+    assert.match(group.id, /^g_[0-9a-f]{8}$/)
+    assert.equal(group.name, '前端')
+    assert.deepEqual(group.nodeIds, [ga.id, gb.id])
+    assert.equal(typeof group.createdAt, 'string')
+    assert.equal(typeof group.updatedAt, 'string')
+
+    // The same group comes back through GET /state: the snapshot is not trimmed.
+    const reread = await snapshotOf(env)
+    assert.deepEqual(reread.graph.groups, snapshot.graph.groups)
+
+    snapshot = await act(env, 'rename-group', { groupId: group.id, name: '界面' })
+    assert.equal(snapshot.graph.groups[0].name, '界面')
+
+    // Cross-group move: 乙 leaves the first group, which keeps 甲.
+    snapshot = await act(env, 'create-group', { name: '后端', nodeIds: [gb.id, gc.id] })
+    assert.deepEqual(snapshot.graph.groups.map((item) => [item.name, item.nodeIds]), [
+      ['界面', [ga.id]],
+      ['后端', [gb.id, gc.id]],
+    ])
+
+    snapshot = await act(env, 'delete-group', { groupId: snapshot.graph.groups[0].id })
+    assert.deepEqual(snapshot.graph.groups.map((item) => item.name), ['后端'])
+
+    // Deleting a member shrinks the group; the last member removes the group.
+    snapshot = await act(env, 'delete-node', { nodeId: gc.id, mode: 'unlink' })
+    assert.deepEqual(snapshot.graph.groups.map((item) => [item.name, item.nodeIds]), [['后端', [gb.id]]])
+    snapshot = await act(env, 'delete-node', { nodeId: gb.id, mode: 'unlink' })
+    assert.deepEqual(snapshot.graph.groups, [])
+
+    const tooSmall = await actExpectFailure(env, 'create-group', { name: '单成员', nodeIds: [ga.id] }, 400)
+    assert.match(tooSmall.body.message, /至少/)
+    snapshot = await act(env, 'delete-node', { nodeId: ga.id, mode: 'unlink' })
+    assert.equal(nodeById(snapshot.graph, ga.id), undefined)
+  })
+
   await t.test('per-node Agent preset/model reach handoff and /catalog lists them', async () => {
     let snapshot = await act(env, 'add-node', { title: '交接任务' })
     const handoffNode = nodeByTitle(snapshot.graph, '交接任务')
@@ -1044,6 +1091,7 @@ test('v2 acceptance: a v1 graph.json is migrated to schemaVersion 2', async (t) 
   assert.equal(graph.revision, 7)
   assert.equal(graph.closeoutNodeId, undefined, 'the v1 closeout field is gone')
   assert.equal(graph.milestoneNodeId, 'n_c', 'closeoutNodeId becomes milestoneNodeId')
+  assert.deepEqual(graph.groups, [], 'a v1 document starts with no groups')
 
   const a = nodeById(graph, 'n_a')
   const b = nodeById(graph, 'n_b')

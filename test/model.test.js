@@ -99,6 +99,7 @@ test('emptyGraph() is a v2 document and derive() tolerates it', () => {
   assert.equal(graph.milestoneNodeId, null)
   assert.deepEqual(graph.nodes, [])
   assert.deepEqual(graph.edges, [])
+  assert.deepEqual(graph.groups, [])
 
   const derived = derive(graph)
   assert.deepEqual(derived.ready, [])
@@ -585,4 +586,104 @@ test('successorsOf reports the satisfied condition of each edge', () => {
   assert.equal(successors.length, 1)
   assert.equal(successors[0].to, 'n_b')
   assert.equal(successors[0].conditionId, 'c_0')
+})
+
+/* ------------------------------------------------------------------ */
+/* groups                                                              */
+/* ------------------------------------------------------------------ */
+
+test('normalizeGraph repairs group metadata and keeps each member at most once', () => {
+  const raw = {
+    schemaVersion: 2,
+    nodes: [makeNode('n_a'), makeNode('n_b'), makeNode('n_c'), makeNode('n_d')],
+    edges: [],
+    groups: [
+      {
+        id: 'g_alpha',
+        name: '  前端  ',
+        nodeIds: ['n_a', 'n_a', 'n_b', 'n_missing'],
+        createdAt: T0,
+        updatedAt: T0,
+      },
+      // Duplicate id is regenerated; a blank name falls back to the label.
+      { id: 'g_alpha', name: '   ', nodeIds: ['n_c'] },
+      // The first group keeps a shared node, so this one keeps only n_d.
+      { id: 'g_beta', name: '跨组', nodeIds: ['n_b', 'n_c', 'n_d'] },
+      { id: 'g_empty', name: '空组合', nodeIds: ['n_missing', 'n_missing'] },
+      'not an object',
+    ],
+  }
+
+  const graph = normalizeGraph(raw)
+  assert.equal(graph.groups.length, 3)
+
+  const [first, regenerated, beta] = graph.groups
+  assert.equal(first.id, 'g_alpha')
+  assert.equal(first.name, '前端')
+  assert.deepEqual(first.nodeIds, ['n_a', 'n_b'], 'duplicates and unknown members are dropped')
+  assert.equal(first.createdAt, T0)
+  assert.equal(first.updatedAt, T0)
+
+  assert.notEqual(regenerated.id, 'g_alpha')
+  assert.match(regenerated.id, /^g_[0-9a-f]{8}$/)
+  assert.equal(regenerated.name, '未命名组合')
+  assert.deepEqual(regenerated.nodeIds, ['n_c'])
+  assert.match(regenerated.createdAt, /^\d{4}-\d{2}-\d{2}T/)
+  assert.equal(regenerated.updatedAt, regenerated.createdAt, 'a missing updatedAt copies createdAt')
+
+  assert.equal(beta.id, 'g_beta')
+  assert.deepEqual(beta.nodeIds, ['n_d'])
+  assert.equal(beta.updatedAt, beta.createdAt)
+
+  const empty = graph.groups.find((group) => group.id === 'g_empty')
+  assert.equal(empty, undefined, 'a group whose members all disappear is dropped')
+})
+
+test('normalizeGraph treats a missing groups field as an empty list', () => {
+  const v2 = normalizeGraph({
+    schemaVersion: 2,
+    nodes: [makeNode('n_a'), makeNode('n_b')],
+    edges: [],
+  })
+  assert.deepEqual(v2.groups, [], 'an old v2 document without groups still reads')
+
+  const v1 = normalizeGraph({
+    schemaVersion: 1,
+    nodes: [makeNode('n_a')],
+    edges: [],
+  })
+  assert.deepEqual(v1.groups, [], 'the v1 migration also starts with no groups')
+})
+
+test('assertInvariants enforces the group invariants', () => {
+  const group = (id, name, nodeIds) => ({ id, name, nodeIds, createdAt: T0, updatedAt: T0 })
+  const base = () => makeGraph([makeNode('n_a'), makeNode('n_b'), makeNode('n_c')])
+
+  const healthy = base()
+  healthy.groups = [group('g_1', '前端', ['n_a', 'n_b']), group('g_2', '后端', ['n_c'])]
+  assert.equal(assertInvariants(healthy), true, 'disjoint groups are valid')
+
+  const duplicateId = base()
+  duplicateId.groups = [group('g_1', 'A', ['n_a']), group('g_1', 'B', ['n_b'])]
+  throwsCode(() => assertInvariants(duplicateId), CODES.invariant, 'duplicate group id rejected')
+
+  const blankName = base()
+  blankName.groups = [group('g_1', '   ', ['n_a'])]
+  throwsCode(() => assertInvariants(blankName), CODES.invariant, 'blank group name rejected')
+
+  const unknownMember = base()
+  unknownMember.groups = [group('g_1', '前端', ['n_a', 'n_missing'])]
+  throwsCode(() => assertInvariants(unknownMember), CODES.invariant, 'unknown group member rejected')
+
+  const sharedMember = base()
+  sharedMember.groups = [group('g_1', '前端', ['n_a', 'n_b']), group('g_2', '后端', ['n_b', 'n_c'])]
+  throwsCode(() => assertInvariants(sharedMember), CODES.invariant, 'a node in two groups rejected')
+
+  const emptyMembers = base()
+  emptyMembers.groups = [group('g_1', '空', [])]
+  throwsCode(() => assertInvariants(emptyMembers), CODES.invariant, 'an empty group rejected')
+
+  const notAnArray = base()
+  notAnArray.groups = 'nope'
+  throwsCode(() => assertInvariants(notAnArray), CODES.invariant, 'a non-array groups field rejected')
 })

@@ -238,7 +238,9 @@ test('buildBrief degrades to a valid brief without history', () => {
   const brief = buildBrief({ graph, node, events: [], derived: {} })
 
   assert.match(brief.text, /^# 交接简报：实现接口/)
-  assert.match(brief.text, /## 任务\n- 状态：待开始\n- 任务描述：无/)
+  assert.match(brief.text, /## 任务\n- 状态：待开始/)
+  assert.match(brief.text, /## 任务描述\n\n以下是[^\n]*\n\n（暂无任务描述）\n\n## 前置/)
+  assert.doesNotMatch(brief.text, /- 任务描述：/)
   assert.match(brief.text, /## 前置\n- 设计数据模型（已完成）/)
   assert.match(brief.text, /## 完成后解锁\n- 无/)
   assert.match(brief.text, /## 上一段会话的最后回复\n（没有可用的历史回复）/)
@@ -276,7 +278,8 @@ test('buildBrief includes notes, flagged prereqs, successors and truncated histo
 
   const brief = buildBrief({ graph, node, events, derived: {} })
 
-  assert.match(brief.text, /- 任务描述：注意兼容旧格式/)
+  assert.match(brief.text, /## 任务描述\n\n以下是[^\n]*\n\n注意兼容旧格式\n\n## 前置/)
+  assert.doesNotMatch(brief.text, /- 任务描述：/)
   assert.match(brief.text, /- 已完成前置（已完成）/)
   assert.match(brief.text, /- 未完成前置（未完成）/)
   assert.match(brief.text, /## 完成后解锁\n- 后续任务/)
@@ -288,6 +291,92 @@ test('buildBrief includes notes, flagged prereqs, successors and truncated histo
   assert.ok(!brief.text.includes('第一个请求'))
   assert.ok(brief.text.includes('第二个请求'))
   assert.ok(brief.text.includes('第三个请求'))
+})
+
+test('buildBrief isolates multi-line Markdown notes from the brief structure', () => {
+  const notes = [
+    '## 目标',
+    '',
+    '- 支持旧格式',
+    '- 保持确定性',
+    '',
+    '```js',
+    "const label = '```'",
+    '```',
+    '',
+    '### 验收',
+    '1. 简报结构完整',
+  ].join('\n')
+  const graph = {
+    nodes: [{ id: 'n1', title: '实现接口', status: 'doing', notes }],
+    edges: [],
+    closeoutNodeId: null,
+  }
+  const brief = buildBrief({ graph, node: graph.nodes[0], events: [] })
+  const lines = brief.text.split('\n')
+
+  assert.ok(brief.text.includes(notes))
+  const notesIndex = lines.indexOf('## 任务描述')
+  const prereqIndex = lines.indexOf('## 前置')
+  assert.ok(notesIndex > 0)
+  assert.ok(prereqIndex > notesIndex)
+  // `## 前置` is a real section after the notes, not list item or code content.
+  assert.match(brief.text, /1\. 简报结构完整\n\n## 前置\n- 无/)
+  // Balanced fences in the notes stay balanced; the brief adds none.
+  assert.equal(lines.filter((line) => line.trimStart().startsWith('```')).length % 2, 0)
+})
+
+test('buildBrief pads an unterminated code fence from the notes', () => {
+  const notes = '## 步骤\n\n```sh\nnode test/sessions.test.js'
+  const node = { id: 'n1', title: '未闭合围栏', status: 'todo', notes }
+  const brief = buildBrief({ node, events: [] })
+
+  assert.match(brief.text, /node test\/sessions\.test\.js\n```\n\n## 前置\n- 无/)
+  const fenceLines = brief.text.split('\n').filter((line) => line.trimStart().startsWith('```'))
+  assert.equal(fenceLines.length, 2)
+  assert.equal(fenceLines.length % 2, 0)
+})
+
+test('buildBrief uses a placeholder for a blank task description', () => {
+  const node = { id: 'n1', title: '空描述', status: 'todo', notes: '  \n\t ' }
+  const brief = buildBrief({ node, events: [] })
+
+  assert.match(brief.text, /## 任务描述\n\n以下是[^\n]*\n\n（暂无任务描述）\n\n## 前置\n- 无/)
+  assert.doesNotMatch(brief.text, /- 任务描述：/)
+})
+
+test('buildBrief truncates long notes at a line boundary without breaking characters', () => {
+  const rows = Array.from({ length: 200 }, (_, index) => `- 第${index + 1}行 ${'字'.repeat(12)}`)
+  const node = { id: 'n1', title: '长描述', status: 'todo', notes: rows.join('\n') }
+  const brief = buildBrief({ node, events: [] })
+
+  const notesPart = brief.text.split('## 任务描述\n\n')[1].split('\n\n## 前置')[0]
+  assert.ok(notesPart.length < 2000 + 200)
+  const bodyLines = notesPart.split('\n\n')[1].split('\n')
+  const marker = bodyLines.indexOf('…（已截断）')
+  assert.ok(marker > 1)
+  const keptLines = bodyLines.slice(0, marker)
+  assert.ok(keptLines.length < rows.length)
+  // Every kept line is whole: the cut landed on a line boundary.
+  for (const line of keptLines) assert.match(line, /^- 第\d+行 字{12}$/)
+
+  // A surrogate pair on the cut boundary must not be torn in half.
+  const emojiNode = { ...node, notes: `a${'😀'.repeat(1500)}` }
+  const emojiBrief = buildBrief({ node: emojiNode, events: [] })
+  assert.ok(emojiBrief.text.includes('…（已截断）'))
+  for (let index = 0; index < emojiBrief.text.length; index += 1) {
+    const code = emojiBrief.text.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = emojiBrief.text.charCodeAt(index + 1)
+      assert.ok(next >= 0xdc00 && next <= 0xdfff, 'brief must not contain a lone high surrogate')
+      index += 1
+    } else {
+      assert.ok(code < 0xdc00 || code > 0xdfff, 'brief must not contain a lone low surrogate')
+    }
+  }
+
+  // Same input, same output: the brief involves no model call or hidden state.
+  assert.equal(buildBrief({ node, events: [] }).text, brief.text)
 })
 
 test('buildBrief tolerates a missing graph and node', () => {

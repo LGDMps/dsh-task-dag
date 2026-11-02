@@ -90,7 +90,7 @@ function makeEdge(id, from, to, conditionId) {
   return { id, from, to, conditionId }
 }
 
-function graphDocument(root, { revision = 3, nodes = [], edges = [], milestoneNodeId = null } = {}) {
+function graphDocument(root, { revision = 3, nodes = [], edges = [], milestoneNodeId = null, groups = [] } = {}) {
   return {
     schemaVersion: 2,
     workspaceId: WORKSPACE_ID,
@@ -101,6 +101,7 @@ function graphDocument(root, { revision = 3, nodes = [], edges = [], milestoneNo
     milestoneNodeId,
     nodes,
     edges,
+    groups,
   }
 }
 
@@ -1026,6 +1027,84 @@ test('action enforces failed-node rules and supports milestone and schedule', as
   })
   assert.equal(badCron.response.status, 400)
   assertErrorBody(badCron.body)
+})
+
+test('action creates, renames and deletes groups and snapshots carry them', async (t) => {
+  const harness = await createHarness()
+  t.after(() => harness.close())
+  await harness.writeGraph(chainGraph(harness.root))
+
+  let revision = 3
+  const post = async (action, payload) => {
+    const result = await harness.postAction({
+      workspaceId: WORKSPACE_ID,
+      action,
+      expectedRevision: revision,
+      payload,
+    })
+    assert.equal(result.response.status, 200, `${action}: ${JSON.stringify(result.body)}`)
+    revision = result.body.snapshot.graph.revision
+    return result.body.snapshot
+  }
+
+  // A document written without groups reads back as an empty list.
+  const opening = await harness.getJson(`${API_PREFIX}/state?workspaceId=${WORKSPACE_ID}`)
+  assert.equal(opening.response.status, 200)
+  assert.deepEqual(opening.body.snapshot.graph.groups, [])
+
+  const created = await post('create-group', {
+    name: '  前端  ',
+    nodeIds: ['n_aaaa1111', 'n_bbbb2222'],
+  })
+  assert.equal(created.graph.groups.length, 1)
+  const group = created.graph.groups[0]
+  assert.match(group.id, /^g_[0-9a-f]{8}$/)
+  assert.equal(group.name, '前端')
+  assert.deepEqual(group.nodeIds, ['n_aaaa1111', 'n_bbbb2222'])
+  assert.equal(typeof group.createdAt, 'string')
+  assert.equal(typeof group.updatedAt, 'string')
+
+  // The route returns the stored graph untouched: groups survive the snapshot.
+  const state = await harness.getJson(`${API_PREFIX}/state?workspaceId=${WORKSPACE_ID}`)
+  assert.equal(state.response.status, 200)
+  assert.deepEqual(state.body.snapshot.graph.groups, [group])
+  assert.deepEqual(state.body.snapshot.graph.groups[0].nodeIds, ['n_aaaa1111', 'n_bbbb2222'])
+
+  const renamed = await post('rename-group', { groupId: group.id, name: '界面' })
+  assert.equal(renamed.graph.groups[0].name, '界面')
+
+  // Moving a member into a new group leaves the old group with the rest.
+  const moved = await post('create-group', {
+    name: '后端',
+    nodeIds: ['n_bbbb2222', 'n_cccc3333'],
+  })
+  assert.deepEqual(moved.graph.groups.map((item) => [item.name, item.nodeIds]), [
+    ['界面', ['n_aaaa1111']],
+    ['后端', ['n_bbbb2222', 'n_cccc3333']],
+  ])
+
+  const deleted = await post('delete-group', { groupId: moved.graph.groups[0].id })
+  assert.deepEqual(deleted.graph.groups.map((item) => item.name), ['后端'])
+
+  const tooSmall = await harness.postAction({
+    workspaceId: WORKSPACE_ID,
+    action: 'create-group',
+    expectedRevision: revision,
+    payload: { name: '只有一人', nodeIds: ['n_aaaa1111'] },
+  })
+  assert.equal(tooSmall.response.status, 400)
+  assert.equal(tooSmall.body.code, 'invalid-request')
+  assertErrorBody(tooSmall.body)
+
+  const unknownGroup = await harness.postAction({
+    workspaceId: WORKSPACE_ID,
+    action: 'rename-group',
+    expectedRevision: revision,
+    payload: { groupId: 'g_missing', name: '不存在' },
+  })
+  assert.equal(unknownGroup.response.status, 404)
+  assert.equal(unknownGroup.body.code, 'not-found')
+  assertErrorBody(unknownGroup.body)
 })
 
 test('events streams the opening revision and the revision after a commit', async (t) => {

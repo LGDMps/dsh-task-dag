@@ -649,6 +649,202 @@ test('delete-node clears a milestone that points at the removed node', async (t)
 })
 
 /* ------------------------------------------------------------------ */
+/* groups                                                              */
+/* ------------------------------------------------------------------ */
+
+test('create-group validates name and members and persists a normalized group', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const b = await addNode(host, store, workspace, { title: 'B' })
+
+  const applied = await act(host, store, workspace, 'create-group', {
+    name: '  前端  ',
+    nodeIds: [a.node.id, b.node.id, a.node.id],
+  })
+  assert.equal(applied.result.group.id, applied.result.groupId)
+  assert.match(applied.result.groupId, /^g_[0-9a-f]{8}$/)
+  assert.equal(applied.result.group.name, '前端')
+  assert.deepEqual(applied.result.group.nodeIds, [a.node.id, b.node.id], 'members are de-duplicated')
+  assert.equal(typeof applied.result.group.createdAt, 'string')
+  assert.equal(applied.result.group.updatedAt, applied.result.group.createdAt)
+  assert.deepEqual(applied.result.changes.movedFrom, [])
+  assert.deepEqual(applied.result.changes.removedGroupIds, [])
+  assert.equal(applied.graph.groups.length, 1)
+
+  const persisted = store.read(workspace).graph.groups
+  assert.deepEqual(persisted.map((group) => group.name), ['前端'], 'the group is written to disk')
+
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: '', nodeIds: [a.node.id, b.node.id] }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: 42, nodeIds: [a.node.id, b.node.id] }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: 'x'.repeat(61), nodeIds: [a.node.id, b.node.id] }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: '单成员', nodeIds: [a.node.id] }),
+    (error) => codeOf(error) === 'invalid-request' && error.details.count === 1,
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: '空成员', nodeIds: [] }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: '缺人', nodeIds: [a.node.id, 'n_missing'] }),
+    (error) => codeOf(error) === 'not-found' && error.details.nodeId === 'n_missing',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'create-group', { name: '坏成员', nodeIds: [a.node.id, 42] }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  assert.equal(store.read(workspace).graph.groups.length, 1, 'failed creates change nothing')
+})
+
+test('create-group moves members across groups and removes emptied old groups', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const b = await addNode(host, store, workspace, { title: 'B' })
+  const c = await addNode(host, store, workspace, { title: 'C' })
+  const d = await addNode(host, store, workspace, { title: 'D' })
+
+  const first = await act(host, store, workspace, 'create-group', {
+    name: '甲', nodeIds: [a.node.id, b.node.id],
+  })
+  const second = await act(host, store, workspace, 'create-group', {
+    name: '乙', nodeIds: [c.node.id, d.node.id],
+  })
+  const firstId = first.result.groupId
+  const secondId = second.result.groupId
+
+  // B and C are already grouped: the move is allowed, not an error.
+  const moved = await act(host, store, workspace, 'create-group', {
+    name: '丙', nodeIds: [b.node.id, c.node.id],
+  })
+  assert.deepEqual(moved.result.changes.movedFrom, [
+    { groupId: firstId, nodeIds: [b.node.id] },
+    { groupId: secondId, nodeIds: [c.node.id] },
+  ])
+  assert.deepEqual(moved.result.changes.removedGroupIds, [])
+  assert.deepEqual(
+    moved.graph.groups.map((group) => [group.name, group.nodeIds]),
+    [['甲', [a.node.id]], ['乙', [d.node.id]], ['丙', [b.node.id, c.node.id]]],
+  )
+
+  // Moving the last member of both remaining groups deletes them.
+  const last = await act(host, store, workspace, 'create-group', {
+    name: '丁', nodeIds: [a.node.id, d.node.id],
+  })
+  assert.deepEqual(last.result.changes.movedFrom, [])
+  assert.deepEqual(last.result.changes.removedGroupIds, [firstId, secondId])
+  assert.deepEqual(
+    last.graph.groups.map((group) => group.name),
+    ['丙', '丁'],
+    'only the two still-occupied groups survive',
+  )
+})
+
+test('rename-group updates the name and updatedAt; unknown ids are not-found', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const b = await addNode(host, store, workspace, { title: 'B' })
+  const created = await act(host, store, workspace, 'create-group', {
+    name: '旧名字', nodeIds: [a.node.id, b.node.id],
+  })
+  const groupId = created.result.groupId
+
+  const applied = await act(host, store, workspace, 'rename-group', { groupId, name: '  新名字  ' })
+  assert.equal(applied.result.name, '新名字')
+  assert.equal(applied.result.group.name, '新名字')
+  assert.ok(
+    Date.parse(applied.result.group.updatedAt) >= Date.parse(created.result.group.updatedAt),
+    'updatedAt is refreshed',
+  )
+  assert.equal(findNode(applied.graph, a.node.id).title, 'A', 'renaming a group leaves nodes untouched')
+
+  await assert.rejects(
+    act(host, store, workspace, 'rename-group', { groupId: 'g_missing', name: '新名字' }),
+    (error) => codeOf(error) === 'not-found' && error.details.groupId === 'g_missing',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'rename-group', { groupId, name: '   ' }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'rename-group', { groupId: '', name: '新名字' }),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+})
+
+test('delete-group removes one group and reports an unknown id', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const b = await addNode(host, store, workspace, { title: 'B' })
+  const c = await addNode(host, store, workspace, { title: 'C' })
+  const first = await act(host, store, workspace, 'create-group', {
+    name: '甲', nodeIds: [a.node.id, b.node.id],
+  })
+  assert.equal(first.result.group.name, '甲')
+  const second = await act(host, store, workspace, 'create-group', {
+    name: '乙', nodeIds: [b.node.id, c.node.id],
+  })
+
+  const applied = await act(host, store, workspace, 'delete-group', {
+    groupId: second.result.groupId,
+  })
+  assert.equal(applied.result.name, '乙')
+  assert.deepEqual(applied.graph.groups.map((group) => group.name), ['甲'])
+
+  await assert.rejects(
+    act(host, store, workspace, 'delete-group', { groupId: second.result.groupId }),
+    (error) => codeOf(error) === 'not-found',
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'delete-group', {}),
+    (error) => codeOf(error) === 'invalid-request',
+  )
+})
+
+test('delete-node clears group membership and drops groups that become empty', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const b = await addNode(host, store, workspace, { title: 'B' })
+  const c = await addNode(host, store, workspace, { title: 'C' })
+  const created = await act(host, store, workspace, 'create-group', {
+    name: '三件套', nodeIds: [a.node.id, b.node.id, c.node.id],
+  })
+  const groupId = created.result.groupId
+
+  let applied = await act(host, store, workspace, 'delete-node', {
+    nodeId: c.node.id, mode: 'unlink',
+  })
+  assert.deepEqual(applied.graph.groups[0].nodeIds, [a.node.id, b.node.id])
+
+  // A group may shrink to one member after a delete; only an empty one vanishes.
+  applied = await act(host, store, workspace, 'delete-node', { nodeId: b.node.id, mode: 'unlink' })
+  assert.equal(applied.graph.groups.length, 1)
+  assert.deepEqual(applied.graph.groups[0].nodeIds, [a.node.id])
+
+  applied = await act(host, store, workspace, 'delete-node', { nodeId: a.node.id, mode: 'unlink' })
+  assert.deepEqual(applied.graph.groups, [], `group ${groupId} is removed with its last member`)
+  assert.deepEqual(store.read(workspace).graph.groups, [])
+})
+
+/* ------------------------------------------------------------------ */
 /* sessions                                                            */
 /* ------------------------------------------------------------------ */
 

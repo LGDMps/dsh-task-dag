@@ -286,7 +286,8 @@ test('buildExecutionBrief renders the deterministic template with conditions', (
   const second = buildExecutionBrief({ graph, node })
   assert.equal(first, second, 'the brief must be deterministic')
   assert.match(first, /^# 定时执行：当前任务/)
-  assert.match(first, /## 任务\n- 状态：待开始\n- 任务描述：注意兼容旧格式/)
+  assert.match(first, /## 任务\n- 状态：待开始\n\n## 任务描述\n\n以下是[^\n]*\n\n注意兼容旧格式\n\n## 前置条件（全部满足才会触发）/)
+  assert.doesNotMatch(first, /- 任务描述：/)
   assert.match(first, /## 前置条件（全部满足才会触发）/)
   assert.match(first, /- 评审通过：已满足/)
   assert.match(first, /- 设计完成：等待 接口设计/)
@@ -298,8 +299,22 @@ test('buildExecutionBrief renders the deterministic template with conditions', (
 test('buildExecutionBrief says a condition-free node can start directly', () => {
   const graph = makeGraph([makeNode({ id: 'n1', title: '独立任务' })])
   const text = buildExecutionBrief({ graph, node: graph.nodes[0] })
-  assert.match(text, /- 任务描述：无/)
-  assert.match(text, /- 无（无条件，可直接开始）/)
+  assert.match(text, /## 任务描述\n\n以下是[^\n]*\n\n（暂无任务描述）\n\n## 前置条件（全部满足才会触发）\n- 无（无条件，可直接开始）/)
+  assert.doesNotMatch(text, /- 任务描述：/)
+})
+
+test('buildExecutionBrief isolates Markdown notes and closes an odd fence', () => {
+  const notes = '## 操作步骤\n\n- 先跑测试\n- 再更新状态\n\n```sh\nnode test/scheduler.test.js'
+  const graph = makeGraph([makeNode({ id: 'n1', title: '含 Markdown 的任务', notes })])
+  const text = buildExecutionBrief({ graph, node: graph.nodes[0] })
+
+  assert.ok(text.includes(notes))
+  // The description's own heading/list stay inside its section, and the
+  // unterminated fence is padded so the next section is still a section.
+  assert.match(text, /node test\/scheduler\.test\.js\n```\n\n## 前置条件（全部满足才会触发）/)
+  assert.match(text, /## 前置条件（全部满足才会触发）\n- 无（无条件，可直接开始）/)
+  const fenceLines = text.split('\n').filter((line) => line.trimStart().startsWith('```'))
+  assert.equal(fenceLines.length, 2)
 })
 
 /* ------------------------------------------------------------------ */

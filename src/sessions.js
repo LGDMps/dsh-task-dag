@@ -149,6 +149,40 @@ function truncateText(text, limit) {
   return `${trimmed.slice(0, limit).trimEnd()}…（已截断）`
 }
 
+/**
+ * Count Markdown code-fence lines in a text.
+ *
+ * A simple line-start count is enough to detect an unbalanced fence: the brief
+ * only needs to know whether the description ends inside an open code block,
+ * not how the fences nest.
+ */
+function countFenceLines(text) {
+  let count = 0
+  for (const line of text.split('\n')) {
+    if (line.trimStart().startsWith('```')) count += 1
+  }
+  return count
+}
+
+/**
+ * Truncate the task description for the brief.
+ *
+ * The limit is counted in UTF-16 units like the other excerpts, but the cut
+ * prefers a line boundary and never splits a surrogate pair, so the excerpt
+ * cannot end in broken text or half a line of Markdown.
+ */
+function truncateNotes(text, limit) {
+  const trimmed = text.trim()
+  if (trimmed.length <= limit) return trimmed
+  let end = limit
+  const last = trimmed.charCodeAt(end - 1)
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1
+  const head = trimmed.slice(0, end)
+  const lineBreak = head.lastIndexOf('\n')
+  const kept = lineBreak > 0 ? head.slice(0, lineBreak) : head
+  return `${kept.trimEnd()}\n…（已截断）`
+}
+
 /* ------------------------------------------------------------------ */
 /* sessionFacts                                                        */
 /* ------------------------------------------------------------------ */
@@ -556,6 +590,35 @@ function extractText(value, depth, seen) {
 }
 
 /**
+ * Render the task-description section shared by the handoff brief and the
+ * scheduled-execution brief.
+ *
+ * The description is user-authored Markdown, so it gets its own section instead
+ * of being embedded in a list item: a heading, list or code fence inside it must
+ * not restructure the brief around it. The output is deterministic and bounded
+ * by NOTES_CHARS.
+ *
+ * @param {string} notes raw node description
+ * @returns {string[]} lines from `## 任务描述` through the last description line
+ */
+export function renderDescriptionSection(notes) {
+  const text = typeof notes === 'string' ? notes.trim() : ''
+  const body = text === '' ? '（暂无任务描述）' : truncateNotes(text, NOTES_CHARS)
+  // An odd fence count means the description ends inside its own code block
+  // (or the truncation dropped the closing fence). Close it so the following
+  // sections are not rendered as code.
+  const fenceFix = text !== '' && countFenceLines(body) % 2 === 1 ? ['```'] : []
+  return [
+    '## 任务描述',
+    '',
+    '以下是节点上记录的任务描述原文（可能包含 Markdown，按原文阅读）：',
+    '',
+    body,
+    ...fenceFix,
+  ]
+}
+
+/**
  * Deterministic handoff brief. No model call, same inputs => same output.
  *
  * @param {{graph: object, node: object, events?: object[], derived?: object}} input
@@ -621,7 +684,8 @@ export function buildBrief({ graph, node, events, derived } = {}) {
     '',
     '## 任务',
     `- 状态：${status}`,
-    `- 任务描述：${notes === '' ? '无' : truncateText(notes, NOTES_CHARS)}`,
+    '',
+    ...renderDescriptionSection(notes),
     '',
     '## 前置',
     ...prereqLines,

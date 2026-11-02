@@ -42,6 +42,9 @@ const CONTRACT_ACTIONS = [
   'detach-session',
   'handoff',
   'archive-sessions',
+  'create-group',
+  'rename-group',
+  'delete-group',
 ]
 
 /** v2 five-state labels and the task-board status tokens they must use. */
@@ -152,8 +155,9 @@ test('renders the v2 surface: conditions, link chooser, settings, schedule, mile
   assert.ok(source.includes('conditionId'), 'existing conditions are posted by id')
   assert.ok(source.includes('默认标题'), 'the new condition title is prefilled')
   assert.match(source, /条件 ' \+ String\(satisfiedCount\)/)
-  assert.match(source, /model\.edgeGroups/)
-  assert.match(source, /group\.length - 1\) \/ 2/)
+  // Parallel edges between one pair keep separate lanes via the group offset.
+  assert.match(source, /groupOffsets/)
+  assert.match(source, /\(index - \(list\.length - 1\) \/ 2\) \* 18/)
 
   // execution settings
   assert.match(source, /Agent 预设/)
@@ -210,12 +214,16 @@ test('milestone is a marker, drafts are flushed, edges avoid unrelated nodes', (
     'the notes textarea is never disabled while an action is pending',
   )
 
-  // A curved edge that would cross a node is re-routed orthogonally.
-  assert.match(source, /function curveClearsObstacles\(/)
+  // Edges are smooth cubic chains only: a blocked direct curve becomes a
+  // smoothed detour (the orthogonal solver is an internal guide), and routed
+  // edges steer clear of each other instead of overlapping.
+  assert.match(source, /function smoothCubicChain\(/)
   assert.match(source, /function solveOrthogonalRoute\(/)
-  assert.match(source, /function routeAroundObstacles\(/)
-  assert.match(source, /function edgePathFor\(/)
+  assert.match(source, /function detourGuide\(/)
+  assert.match(source, /function routeEdgeSet\(/)
+  assert.match(source, /function chaikinSmooth\(/)
   assert.match(source, /const EDGE_CLEARANCE =/)
+  assert.match(source, /const EDGE_SEPARATION =/)
 })
 
 test('keeps the UI polish invariants: DSH font scale, resizable columns, markdown notes, docked notice', () => {

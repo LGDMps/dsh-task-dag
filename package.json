@@ -45,6 +45,6 @@
     "scheduler": "0.23.2"
   },
   "scripts": {
-    "test": "node test/model.test.js && node test/store.test.js && node test/ops.test.js && node test/sessions.test.js && node test/services.test.js && node test/description.test.js && node test/scheduler.test.js && node test/routes.test.js && node test/client.syntax.test.js && node test/client.routing.test.js && node test/client.mount.test.js && node test/acceptance.integration.test.js"
+    "test": "node test/model.test.js && node test/store.test.js && node test/ops.test.js && node test/sessions.test.js && node test/services.test.js && node test/description.test.js && node test/scheduler.test.js && node test/routes.test.js && node test/client.syntax.test.js && node test/client.routing.test.js && node test/client.mount.test.js && node test/client.interactions.test.js && node test/acceptance.integration.test.js"
   }
 }

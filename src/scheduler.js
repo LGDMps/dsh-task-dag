@@ -28,6 +28,7 @@ import {
   promptSession,
   readSessionEvents,
   renameSession,
+  renderDescriptionSection,
   sessionFacts,
 } from './sessions.js'
 import { getService } from './services.js'
@@ -38,7 +39,6 @@ const DEFAULT_POLL_MS = 5_000
 const EVENTS_PER_SETTLEMENT = 120
 const MAX_ERROR_CHARS = 500
 const MAX_SESSION_TITLE_CHARS = 120
-const NOTES_CHARS = 2000
 
 const STATUS_LABELS = Object.freeze({
   planned: '待规划',
@@ -169,7 +169,6 @@ export function buildExecutionBrief({ graph, node, derived } = {}) {
     ? target.title.trim()
     : '（未命名任务）'
   const status = STATUS_LABELS[target.status] ?? '待开始'
-  const notes = typeof target.notes === 'string' ? target.notes.trim() : ''
   const graphRef = isRecord(graph) ? graph : null
 
   const projected = isRecord(derived)
@@ -206,7 +205,8 @@ export function buildExecutionBrief({ graph, node, derived } = {}) {
     '',
     '## 任务',
     `- 状态：${status}`,
-    `- 任务描述：${notes === '' ? '无' : truncate(notes, NOTES_CHARS)}`,
+    '',
+    ...renderDescriptionSection(target.notes),
     '',
     '## 前置条件（全部满足才会触发）',
     ...conditionLines,

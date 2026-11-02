@@ -10,6 +10,9 @@
  *   - a failed node may never be the source of an edge;
  *   - one project milestone (`milestoneNodeId`): a plain node marker with no
  *     special edge rules and no project-completion semantics;
+ *   - node *groups*: an optional visual grouping of nodes (at least two at
+ *     creation time); a node belongs to at most one group, and a group carries
+ *     no ordering semantics;
  *   - per-node execution target (`agentPreset` / `model`) and schedule.
  *
  * Everything stored is the graph itself. "Can this task start?" is derived on
@@ -41,7 +44,9 @@ const HANDOFF_MODES = ['manual', 'brief', 'blank', 'attach', 'scheduled']
 const SCHEDULE_RESULTS = ['succeeded', 'failed', 'skipped']
 const UNTITLED = '未命名任务'
 const UNTITLED_CONDITION = '前置条件'
+const UNTITLED_GROUP = '未命名组合'
 const MAX_CONDITION_TITLE = 200
+const MAX_GROUP_NAME = 60
 const MAX_TARGET_ID = 200
 
 /** Random, greppable ids: `<stem>_<8 lowercase hex>` (e.g. `n_1a2b3c4d`). */
@@ -68,6 +73,7 @@ export function emptyGraph({ workspaceId = '', workspacePath = '', title = '' } 
     milestoneNodeId: null,
     nodes: [],
     edges: [],
+    groups: [],
   }
 }
 
@@ -334,6 +340,56 @@ function normalizeEdges(rawEdges, byId, idSeen) {
   return edges
 }
 
+/* ------------------------------------------------------------------ */
+/* groups                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Repair the group list of a parsed document.
+ *
+ * Groups are pure presentation data, so nothing here throws: unknown members
+ * are dropped, a repeated member is dropped, ids are de-duplicated and a group
+ * that loses every member disappears. When the same node is claimed by two
+ * groups, the first group in document order keeps it. A group that still has a
+ * member after the repair is kept even with a single member: deleting a node
+ * can legitimately shrink a group, and the UI must be able to draw it.
+ */
+function normalizeGroups(rawGroups, byId) {
+  const list = Array.isArray(rawGroups) ? rawGroups : []
+  const groups = []
+  const seenGroupIds = new Set()
+  const claimedNodeIds = new Set()
+  for (const raw of list) {
+    if (!isRecord(raw)) continue
+    const rawName = nonEmptyText(raw.name)
+    const name = (rawName === '' ? UNTITLED_GROUP : rawName).slice(0, MAX_GROUP_NAME)
+    let id = nonEmptyText(raw.id)
+    if (id === '' || seenGroupIds.has(id)) id = uniqueId(seenGroupIds, 'g')
+    seenGroupIds.add(id)
+
+    const nodeIds = []
+    for (const rawNodeId of Array.isArray(raw.nodeIds) ? raw.nodeIds : []) {
+      const nodeId = nonEmptyText(rawNodeId)
+      if (nodeId === '' || !byId.has(nodeId) || claimedNodeIds.has(nodeId)) continue
+      claimedNodeIds.add(nodeId)
+      nodeIds.push(nodeId)
+    }
+    // A group without members has nothing to outline; drop it instead of
+    // persisting a record that can never become visible again.
+    if (nodeIds.length === 0) continue
+
+    const createdAt = isoOr(raw.createdAt, nowIso())
+    groups.push({
+      id,
+      name,
+      nodeIds,
+      createdAt,
+      updatedAt: isoOr(raw.updatedAt, createdAt),
+    })
+  }
+  return groups
+}
+
 function looksLikeV2(raw) {
   if (raw.milestoneNodeId !== undefined) return true
   if (Array.isArray(raw.nodes)
@@ -397,6 +453,7 @@ export function normalizeGraph(raw) {
 
   const milestoneId = nonEmptyText(raw.milestoneNodeId ?? raw.closeoutNodeId)
   graph.milestoneNodeId = seenNodeIds.has(milestoneId) ? milestoneId : null
+  graph.groups = normalizeGroups(raw.groups, byId)
   return graph
 }
 
@@ -1188,6 +1245,47 @@ export function assertInvariants(graph) {
       throw invariantError(`里程碑节点不存在：${String(graph.milestoneNodeId)}。`, {
         milestoneNodeId: graph.milestoneNodeId,
       })
+    }
+  }
+
+  // Groups: ids unique, names non-empty, members are real and belong to at most
+  // one group. A missing field is tolerated for in-process callers that build a
+  // document literal, but anything stored back must be a real array.
+  if (graph.groups !== undefined && !Array.isArray(graph.groups)) {
+    throw invariantError('任务图的 groups 必须是数组。')
+  }
+  const groupIds = new Set()
+  const groupOwner = new Map()
+  for (const group of Array.isArray(graph.groups) ? graph.groups : []) {
+    if (!isRecord(group)) throw invariantError('组合必须是对象。')
+    if (typeof group.id !== 'string' || group.id === '') {
+      throw invariantError('组合 id 必须是非空字符串。', { groupId: group.id ?? null })
+    }
+    if (groupIds.has(group.id)) {
+      throw invariantError(`组合 id 重复：${group.id}。`, { groupId: group.id })
+    }
+    groupIds.add(group.id)
+    if (typeof group.name !== 'string' || group.name.trim() === '') {
+      throw invariantError(`组合 ${group.id} 缺少名称。`, { groupId: group.id })
+    }
+    if (!Array.isArray(group.nodeIds) || group.nodeIds.length === 0) {
+      throw invariantError(`组合 ${group.id} 没有任何成员。`, { groupId: group.id })
+    }
+    for (const nodeId of group.nodeIds) {
+      if (typeof nodeId !== 'string' || nodeId === '' || !byId.has(nodeId)) {
+        throw invariantError(`组合 ${group.id} 的成员指向不存在的任务 ${String(nodeId)}。`, {
+          groupId: group.id,
+          nodeId: nodeId ?? null,
+        })
+      }
+      const previousOwner = groupOwner.get(nodeId)
+      if (previousOwner !== undefined) {
+        throw invariantError(
+          `任务 ${nodeId} 同时属于组合 ${previousOwner} 和 ${group.id}；一个任务最多属于一个组合。`,
+          { nodeId, groupIds: [previousOwner, group.id] },
+        )
+      }
+      groupOwner.set(nodeId, group.id)
     }
   }
 

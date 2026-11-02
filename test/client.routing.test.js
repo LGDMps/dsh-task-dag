@@ -280,7 +280,8 @@ test('an edge routes around a node it does not connect', async (t) => {
   for (const path of paths) {
     const d = path.getAttribute('d') ?? ''
     assert.ok(d !== '', 'the edge has path data')
-    assert.match(d, /[LQ]/, 'the blocked curve is replaced by a routed polyline')
+    assert.match(d, /^M [-\d.]+ [-\d.]+ C /, 'the edge is drawn as a cubic curve')
+    assert.equal(/[LQ]/.test(d), false, 'the detour is still a curve: no line or right-angle segment')
     const points = samplePath(d)
     assert.ok(points.length > 4, 'the routed path has enough samples')
     for (const point of points) {
@@ -300,6 +301,19 @@ test('an edge routes around a node it does not connect', async (t) => {
   const first = paths[0].getAttribute('d')
   const second = paths[1].getAttribute('d')
   assert.notEqual(first, second, 'parallel edges keep separate lanes after routing')
+
+  // The lanes must stay apart for the whole middle stretch, not just be two
+  // different path strings: overlapping curves are the problem this fixes.
+  const samples = [samplePath(first, 64), samplePath(second, 64)].map((points) => (
+    points.slice(Math.floor(points.length * 0.2), Math.floor(points.length * 0.8))
+  ))
+  let minimumGap = Infinity
+  for (const point of samples[0]) {
+    for (const other of samples[1]) {
+      minimumGap = Math.min(minimumGap, Math.hypot(point.x - other.x, point.y - other.y))
+    }
+  }
+  assert.ok(minimumGap >= 6, 'parallel edges do not lie on top of each other (gap ' + minimumGap.toFixed(1) + 'px)')
 
   await act(async () => {
     root.unmount()

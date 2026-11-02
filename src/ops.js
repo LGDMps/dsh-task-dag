@@ -59,6 +59,9 @@ export const SUPPORTED_ACTIONS = Object.freeze([
   'add-condition',
   'update-condition',
   'delete-condition',
+  'create-group',
+  'rename-group',
+  'delete-group',
   'set-schedule',
   'attach-session',
   'switch-session',
@@ -77,6 +80,8 @@ const MAX_CONDITION_CHARS = 200
 const MAX_TARGET_CHARS = 200
 const MAX_SESSION_TITLE_CHARS = 120
 const MAX_SCHEDULE_ERROR_CHARS = 500
+const MAX_GROUP_NAME_CHARS = 60
+const MIN_GROUP_MEMBERS = 2
 const TAIL_MESSAGES = 12
 
 /* ------------------------------------------------------------------ */
@@ -179,6 +184,13 @@ function requireSessionId(value) {
   return value
 }
 
+function requireGroupId(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw invalidRequest('缺少组合 ID。', { field: 'groupId' })
+  }
+  return value
+}
+
 function requireNode(graph, value) {
   const nodeId = requireNodeId(value)
   const node = findNode(graph, nodeId)
@@ -186,6 +198,16 @@ function requireNode(graph, value) {
     throw notFound('没有找到这个任务节点。', { nodeId })
   }
   return node
+}
+
+function requireGroup(graph, value) {
+  const groupId = requireGroupId(value)
+  const groups = Array.isArray(graph?.groups) ? graph.groups : []
+  const group = groups.find((item) => item?.id === groupId)
+  if (group === undefined) {
+    throw notFound('没有找到这个组合。', { groupId })
+  }
+  return group
 }
 
 function cleanTitle(value) {
@@ -220,6 +242,18 @@ function cleanConditionTitle(value) {
     throw invalidRequest(`前置条件标题太长，最多 ${MAX_CONDITION_CHARS} 个字。`, { field: 'title' })
   }
   return title
+}
+
+function cleanGroupName(value) {
+  if (typeof value !== 'string') {
+    throw invalidRequest('组合名称必须是文字。', { field: 'name' })
+  }
+  const name = value.trim()
+  if (name === '') throw invalidRequest('组合名称不能为空。', { field: 'name' })
+  if (name.length > MAX_GROUP_NAME_CHARS) {
+    throw invalidRequest(`组合名称太长，最多 ${MAX_GROUP_NAME_CHARS} 个字。`, { field: 'name' })
+  }
+  return name
 }
 
 /**
@@ -638,6 +672,7 @@ function deleteNode(current, payload) {
 
   next.nodes = next.nodes.filter((item) => item.id !== node.id)
   next.edges = Array.isArray(rewired.edges) ? rewired.edges : []
+  next.groups = groupsWithoutNode(next, node.id)
   if (next.milestoneNodeId === node.id) next.milestoneNodeId = null
   const orphaned = orphanedConditions(next, outbound, node.id)
 
@@ -795,6 +830,115 @@ function setMilestone(current, payload) {
     next,
     event: { type: 'milestone/set', data: { milestoneNodeId: nodeId } },
     result: { milestoneNodeId: nodeId },
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* groups                                                              */
+/* ------------------------------------------------------------------ */
+
+/** Drop one node from every group; a group that loses its last member goes away. */
+function groupsWithoutNode(graph, nodeId, now = nowIso()) {
+  const kept = []
+  for (const group of Array.isArray(graph?.groups) ? graph.groups : []) {
+    if (!Array.isArray(group?.nodeIds) || !group.nodeIds.includes(nodeId)) {
+      kept.push(group)
+      continue
+    }
+    group.nodeIds = group.nodeIds.filter((item) => item !== nodeId)
+    if (group.nodeIds.length === 0) continue
+    group.updatedAt = now
+    kept.push(group)
+  }
+  return kept
+}
+
+/**
+ * Move `nodeIds` out of every existing group, dropping groups that end up
+ * empty. The caller owns `next` (a deep copy); returns what moved for the event.
+ */
+function detachNodesFromGroups(next, nodeIds, now) {
+  const members = new Set(nodeIds)
+  const movedFrom = []
+  const removedGroupIds = []
+  const keptGroups = []
+  for (const group of Array.isArray(next.groups) ? next.groups : []) {
+    const movedNodeIds = group.nodeIds.filter((nodeId) => members.has(nodeId))
+    if (movedNodeIds.length === 0) {
+      keptGroups.push(group)
+      continue
+    }
+    group.nodeIds = group.nodeIds.filter((nodeId) => !members.has(nodeId))
+    if (group.nodeIds.length === 0) {
+      removedGroupIds.push(group.id)
+      continue
+    }
+    group.updatedAt = now
+    movedFrom.push({ groupId: group.id, nodeIds: movedNodeIds })
+    keptGroups.push(group)
+  }
+  next.groups = keptGroups
+  return { movedFrom, removedGroupIds }
+}
+
+/**
+ * Create a group. Moving members out of other groups is the documented way to
+ * change a node's group, so overlapping membership is repaired instead of
+ * rejected; an old group that loses every member is removed with it.
+ */
+function createGroup(current, payload) {
+  const name = cleanGroupName(payload.name)
+  const nodeIds = cleanNodeIdList(payload.nodeIds, 'nodeIds', '组合成员')
+  if (nodeIds.length < MIN_GROUP_MEMBERS) {
+    throw invalidRequest(`一个组合至少需要 ${MIN_GROUP_MEMBERS} 个任务。`, {
+      field: 'nodeIds',
+      count: nodeIds.length,
+    })
+  }
+  for (const nodeId of nodeIds) {
+    if (findNode(current, nodeId) === undefined) {
+      throw notFound('组合成员任务不存在，请刷新后重试。', { nodeId })
+    }
+  }
+
+  const next = cloneGraph(current)
+  const now = nowIso()
+  const { movedFrom, removedGroupIds } = detachNodesFromGroups(next, nodeIds, now)
+  const group = { id: newId('g'), name, nodeIds, createdAt: now, updatedAt: now }
+  next.groups.push(group)
+
+  return {
+    next,
+    event: {
+      type: 'group/create',
+      data: { groupId: group.id, name, nodeIds, movedFrom, removedGroupIds },
+    },
+    result: { groupId: group.id, group, changes: { name, nodeIds, movedFrom, removedGroupIds } },
+  }
+}
+
+function renameGroup(current, payload) {
+  const name = cleanGroupName(payload.name)
+  const next = cloneGraph(current)
+  const group = requireGroup(next, payload.groupId)
+  group.name = name
+  group.updatedAt = nowIso()
+  return {
+    next,
+    event: { type: 'group/rename', data: { groupId: group.id, name } },
+    result: { groupId: group.id, name, group },
+  }
+}
+
+function deleteGroup(current, payload) {
+  const next = cloneGraph(current)
+  const group = requireGroup(next, payload.groupId)
+  next.groups = (Array.isArray(next.groups) ? next.groups : []).filter((item) => item.id !== group.id)
+  const nodeIds = [...group.nodeIds]
+  return {
+    next,
+    event: { type: 'group/delete', data: { groupId: group.id, name: group.name, nodeIds } },
+    result: { groupId: group.id, name: group.name, nodeIds },
   }
 }
 
@@ -1481,6 +1625,18 @@ export async function applyAction(ctx, store, workspace, request) {
     case 'delete-condition':
       return runMutation(store, workspace, request.expectedRevision,
         (current) => deleteCondition(current, payload))
+
+    case 'create-group':
+      return runMutation(store, workspace, request.expectedRevision,
+        (current) => createGroup(current, payload))
+
+    case 'rename-group':
+      return runMutation(store, workspace, request.expectedRevision,
+        (current) => renameGroup(current, payload))
+
+    case 'delete-group':
+      return runMutation(store, workspace, request.expectedRevision,
+        (current) => deleteGroup(current, payload))
 
     case 'set-schedule':
       return runMutation(store, workspace, request.expectedRevision,

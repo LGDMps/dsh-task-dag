@@ -5,10 +5,16 @@
  * nodes, prerequisite conditions (edges satisfy one condition each), per-node
  * agent preset/model, per-node cron schedule, and one project milestone (a
  * marker only: a done milestone never finishes the project). Each node owns an
- * ordered chain of chat sessions with exactly one current session. Edges route
- * around the nodes they do not connect, and the detail drawer autosaves its
- * text drafts before the selection moves. The Host half owns the graph file;
- * this file only renders the snapshot and posts actions back to it.
+ * ordered chain of chat sessions with exactly one current session.
+ *
+ * The canvas draws every edge as a smooth cubic chain that steers around
+ * unrelated cards and away from the other edges (no orthogonal segments), fits
+ * a long node title to the card width and clips whatever still overflows, can
+ * undo a node drag or an auto layout, and turns an Alt + left-drag lasso of
+ * fully enclosed nodes into a named group with a dashed, grid-aligned contour.
+ * The detail drawer autosaves its text drafts before the selection moves. The
+ * Host half owns the graph file (including groups); this file only renders the
+ * snapshot and posts actions back to it.
  *
  * Platform facts this file depends on (verified against DSH 0.2.1-rc.3):
  *   - loaded as one self-contained module by `window.__ModuleLoader__.load`;
@@ -235,20 +241,30 @@ window.__ModuleLoader__.load({
     const AUTO_ISOLATED_COLUMNS = 3
     const LAYOUT_PAD = 20
 
-    // Edge routing. A curve is kept whenever it stays clear of the nodes it does
-    // not connect; otherwise the edge is re-routed as a rounded orthogonal path
-    // around the blocking rectangles. `CLEARANCE` is added to every obstacle
-    // rectangle so a routed line never grazes a card, and `STUB` keeps the first
-    // and last segments horizontal where they leave/enter a node handle.
+    // Edge routing. Every edge is a smooth cubic chain: the direct curve when it
+    // is clean, otherwise a smoothed detour around the cards in between.
+    // `CLEARANCE` is added to every obstacle rectangle so a curve never grazes a
+    // card, and `SEPARATION` is the distance two unrelated edges try to keep so
+    // they do not lie on top of each other. Orthogonal routes are only used as
+    // an internal waypoint guide; no right-angle segment ever reaches the SVG.
     const EDGE_CLEARANCE = 10
     const EDGE_STUB = 14
     const EDGE_TURN_COST = 22
-    const EDGE_CURVE_STEPS = 48
-    const EDGE_ROUTE_PAD = 120
+    const EDGE_CURVE_STEPS = 32
+    const EDGE_ROUTE_PAD = 160
+    const EDGE_SEPARATION = 8
+    const EDGE_ANCHOR_STEP = 10
+    const EDGE_ANCHOR_LIMIT = 24
+    const EDGE_GUIDE_PAD = 20
+    const EDGE_BOWS = [0, 44, -44, 86, -86]
 
     // Text fields save themselves: a quiet delay after typing, on blur, and
     // before the panel switches nodes or unmounts.
     const DRAFT_SAVE_DELAY = 700
+
+    // Position undo: drags and auto layouts are the only position-changing
+    // gestures, so a small stack of pre-gesture position maps covers them.
+    const UNDO_LIMIT = 20
 
     // Grid mode: cells are golden-ratio rectangles; a node's centre snaps to
     // the cell centre. 320 x 198 is ~1.616:1, close to φ and roomy enough for
@@ -472,6 +488,18 @@ window.__ModuleLoader__.load({
       '.dsh-td-handle-line{stroke:var(--dsw-alias-border-l3);stroke-width:1}',
       '.dsh-td-handle{fill:var(--dsw-alias-bg-layer-1);stroke:var(--dsw-alias-brand-primary);stroke-width:1.4;cursor:crosshair}',
       '.dsh-td-handle:hover{fill:var(--dsw-alias-brand-primary)}',
+      // groups: a dashed contour whose edges sit on the layout grid
+      '.dsh-td-group-outline{fill:none;stroke:var(--dsw-alias-brand-primary);stroke-width:1.4;stroke-dasharray:7 5;opacity:.75;pointer-events:none}',
+      '.dsh-td-group-selected .dsh-td-group-outline{stroke-width:2;opacity:1}',
+      '.dsh-td-group-hit{fill:none;stroke:transparent;stroke-width:12;cursor:pointer}',
+      '.dsh-td-group-label{fill:var(--dsw-alias-brand-primary);font-size:var(--dsh-td-fs-xs);font-family:inherit;',
+      'paint-order:stroke;stroke:var(--dsw-alias-bg-base);stroke-width:3px;pointer-events:none}',
+      '.dsh-td-group-selected .dsh-td-group-label{fill:var(--dsw-alias-label-primary)}',
+      // hand-drawn lasso preview (Alt + left drag)
+      '.dsh-td-lasso{fill:var(--dsw-alias-brand-primary);fill-opacity:.07;stroke:var(--dsw-alias-brand-primary);',
+      'stroke-width:1.2;stroke-dasharray:6 4;pointer-events:none}',
+      '.dsh-td-lasso-count{fill:var(--dsw-alias-brand-primary);font-size:var(--dsh-td-fs-xs);font-family:inherit;',
+      'paint-order:stroke;stroke:var(--dsw-alias-bg-base);stroke-width:3px;pointer-events:none}',
       '@keyframes dsh-td-breathe{0%,100%{opacity:.25}50%{opacity:1}}',
 
       // detail drawer
@@ -777,18 +805,76 @@ window.__ModuleLoader__.load({
       return normalizePathForCompare(left) === normalizePathForCompare(right)
     }
 
+    // -- node title fitting --------------------------------------------------
+    // The card is 208px wide with 16px padding on each side, so a title line
+    // has ~176px. CJK glyphs are ~1em wide and Latin glyphs ~0.55em, so a fixed
+    // character count is wrong for mixed titles: it lets wide CJK strings over-
+    // flow the border and wastes space on Latin ones. Widths are measured in em
+    // units (relative to the inherited font size) and the drawing side clips
+    // whatever still does not fit.
+    const TITLE_LINE_EM = 12.4
+
+    function glyphWidthEm(char) {
+      const code = char.codePointAt(0)
+      if (code === undefined) return 0
+      if (code < 32) return 0
+      // Combining marks and zero-width joiners do not advance the pen.
+      if ((code >= 0x0300 && code <= 0x036f) || code === 0x200b || code === 0x200d
+        || (code >= 0xfe00 && code <= 0xfe0f)) return 0
+      const wide = code >= 0x1100 && (
+        code <= 0x115f
+        || code === 0x2329 || code === 0x232a
+        || code === 0x303f
+        || (code >= 0x2e80 && code <= 0xa4cf)
+        || (code >= 0xac00 && code <= 0xd7a3)
+        || (code >= 0xf900 && code <= 0xfaff)
+        || (code >= 0xfe10 && code <= 0xfe19)
+        || (code >= 0xfe30 && code <= 0xfe6f)
+        || (code >= 0xff00 && code <= 0xff60)
+        || (code >= 0xffe0 && code <= 0xffe6)
+        || (code >= 0x1f300 && code <= 0x1faff)
+        || (code >= 0x20000 && code <= 0x3fffd)
+      )
+      return wide ? 1 : 0.55
+    }
+
+    function textWidthEm(chars) {
+      let width = 0
+      for (const char of chars) width += glyphWidthEm(char)
+      return width
+    }
+
+    /** Split `chars` into the longest prefix that fits `limit` em units. */
+    function takeFitting(chars, limit) {
+      const taken = []
+      let width = 0
+      for (const char of chars) {
+        const next = width + glyphWidthEm(char)
+        if (next > limit) break
+        taken.push(char)
+        width = next
+      }
+      return { taken, rest: chars.slice(taken.length), width }
+    }
+
     function titleLines(title) {
       const raw = title === undefined || title === null ? '' : String(title)
       const text = raw.replace(/\s+/g, ' ').trim() || '未命名任务'
       const chars = Array.from(text)
-      // The card is 208px wide with 16px padding on each side. Two lines of
-      // 12 CJK glyphs fit the default DSH font size (14px); the previous 13
-      // was tuned for a 13px custom font.
-      if (chars.length <= 12) return [chars.join('')]
-      const first = chars.slice(0, 12).join('')
-      const rest = chars.slice(12)
-      const second = rest.length <= 12 ? rest.join('') : rest.slice(0, 11).join('') + '…'
-      return [first, second]
+      if (textWidthEm(chars) <= TITLE_LINE_EM) return [chars.join('')]
+      const first = takeFitting(chars, TITLE_LINE_EM)
+      if (first.rest.length === 0) return [first.taken.join('')]
+      // Reserve the ellipsis width on the last line so it does not stick out.
+      const second = takeFitting(first.rest, TITLE_LINE_EM - glyphWidthEm('…'))
+      const secondText = second.rest.length === 0
+        ? second.taken.join('')
+        : second.taken.join('') + '…'
+      return [first.taken.join(''), secondText]
+    }
+
+    /** A safe, unique-enough fragment for an SVG `id`. */
+    function idFragment(value) {
+      return String(value === undefined || value === null ? '' : value).replace(/[^a-zA-Z0-9_-]/g, '_')
     }
 
     function round1(value) {
@@ -1769,18 +1855,6 @@ window.__ModuleLoader__.load({
         }
       }
 
-      // Multiple edges between the same pair of nodes are legitimate: each
-      // edge satisfies a different condition and is drawn with its own arc.
-      const edgeGroups = {}
-      for (const edge of edges) {
-        const key = edge.from + '→' + edge.to
-        if (edgeGroups[key] === undefined) edgeGroups[key] = []
-        edgeGroups[key].push(edge)
-      }
-      Object.keys(edgeGroups).forEach((key) => {
-        edgeGroups[key].sort((left, right) => String(left.conditionId || '').localeCompare(String(right.conditionId || '')))
-      })
-
       const levels = computeLevels(nodes, edges)
       const hasManualPosition = (node) => node.position !== null && typeof node.position === 'object'
         && Number.isFinite(Number(node.position.x)) && Number.isFinite(Number(node.position.y))
@@ -1790,6 +1864,33 @@ window.__ModuleLoader__.load({
       for (const node of nodes) {
         if (!hasManualPosition(node)) continue
         positions[node.id] = { x: Number(node.position.x), y: Number(node.position.y) }
+      }
+
+      // Groups are optional structural annotations. The Host already repairs
+      // them; the client mirrors the same rules so an old or hand-edited
+      // document cannot draw an outline with ghost members or one node in two
+      // groups. A group whose members all disappeared is dropped.
+      const groups = []
+      const groupOfNode = {}
+      const seenGroupIds = new Set()
+      const rawGroups = Array.isArray(graph.groups) ? graph.groups : []
+      for (const raw of rawGroups) {
+        if (raw === null || typeof raw !== 'object') continue
+        const id = typeof raw.id === 'string' ? raw.id : ''
+        if (id === '' || seenGroupIds.has(id)) continue
+        const name = typeof raw.name === 'string' && raw.name.trim() !== '' ? raw.name.trim() : '未命名组合'
+        const members = []
+        for (const nodeId of Array.isArray(raw.nodeIds) ? raw.nodeIds : []) {
+          if (typeof nodeId !== 'string' || nodeId === '') continue
+          if (!nodeIds.has(nodeId)) continue
+          if (members.indexOf(nodeId) >= 0) continue
+          if (groupOfNode[nodeId] !== undefined) continue
+          members.push(nodeId)
+        }
+        if (members.length === 0) continue
+        seenGroupIds.add(id)
+        groups.push({ id, name, nodeIds: members })
+        for (const nodeId of members) groupOfNode[nodeId] = id
       }
 
       const facts = normalizeSessionFacts(source !== null ? source.sessions : null)
@@ -1818,9 +1919,10 @@ window.__ModuleLoader__.load({
         incoming,
         outgoing,
         conditions,
-        edgeGroups,
         levels,
         positions,
+        groups,
+        groupOfNode,
         ready,
         blocked,
         progress,
@@ -1950,15 +2052,108 @@ window.__ModuleLoader__.load({
       return true
     }
 
-    /** True when the ordinary curve stays clear of every obstacle. */
-    function curveClearsObstacles(from, to, offset, obstacles) {
-      if (obstacles.length === 0) return true
-      const controls = curveControls(from, to, offset)
-      let previous = from
-      for (let step = 1; step <= EDGE_CURVE_STEPS; step += 1) {
-        const point = cubicPoint(from, to, controls, step / EDGE_CURVE_STEPS)
-        if (!segmentClear(previous, point, obstacles)) return false
-        previous = point
+    /* ------------------------------------------------------------------ */
+    /* geometry shared by edge routing, lasso selection and group outlines */
+    /* ------------------------------------------------------------------ */
+
+    function distanceBetween(a, b) {
+      return Math.hypot(b.x - a.x, b.y - a.y)
+    }
+
+    function polylineLength(points) {
+      let length = 0
+      for (let index = 1; index < points.length; index += 1) {
+        length += distanceBetween(points[index - 1], points[index])
+      }
+      return length
+    }
+
+    function pointsBoundingBox(points) {
+      let left = Infinity
+      let top = Infinity
+      let right = -Infinity
+      let bottom = -Infinity
+      for (const point of points) {
+        if (point.x < left) left = point.x
+        if (point.x > right) right = point.x
+        if (point.y < top) top = point.y
+        if (point.y > bottom) bottom = point.y
+      }
+      return { left, top, right, bottom }
+    }
+
+    function boxesNear(a, b, gap) {
+      return a.left - gap <= b.right && b.left - gap <= a.right
+        && a.top - gap <= b.bottom && b.top - gap <= a.bottom
+    }
+
+    /** Smallest distance between two sampled polylines (0 when they touch). */
+    function polylineDistance(a, b) {
+      let minimum = Infinity
+      for (const point of a) {
+        for (const other of b) {
+          const distance = distanceBetween(point, other)
+          if (distance < minimum) {
+            minimum = distance
+            if (minimum === 0) return 0
+          }
+        }
+      }
+      return minimum
+    }
+
+    /** Ray-casting point-in-polygon; the polygon may be open (last closes to first). */
+    function pointInPolygon(x, y, polygon) {
+      if (polygon.length < 3) return false
+      let inside = false
+      for (let index = 0, previous = polygon.length - 1; index < polygon.length; previous = index, index += 1) {
+        const currentPoint = polygon[index]
+        const previousPoint = polygon[previous]
+        const crosses = (currentPoint.y > y) !== (previousPoint.y > y)
+        if (!crosses) continue
+        const xAtY = ((previousPoint.x - currentPoint.x) * (y - currentPoint.y))
+          / (previousPoint.y - currentPoint.y) + currentPoint.x
+        if (x < xAtY) inside = !inside
+      }
+      return inside
+    }
+
+    /** Remove consecutive duplicates and collinear middle points. */
+    function simplifyPolyline(points) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || last.x !== point.x || last.y !== point.y) clean.push({ x: point.x, y: point.y })
+      }
+      if (clean.length < 3) return clean
+      const out = [clean[0]]
+      for (let index = 1; index < clean.length - 1; index += 1) {
+        const before = out[out.length - 1]
+        const current = clean[index]
+        const after = clean[index + 1]
+        const collinear = (before.x === current.x && current.x === after.x)
+          || (before.y === current.y && current.y === after.y)
+        if (!collinear) out.push(current)
+      }
+      out.push(clean[clean.length - 1])
+      return out
+    }
+
+    /** Fully inside: every corner is inside and no polygon edge cuts the card. */
+    function rectFullyInsidePolygon(rect, polygon) {
+      if (polygon.length < 3) return false
+      const corners = [
+        { x: rect.left, y: rect.top },
+        { x: rect.right, y: rect.top },
+        { x: rect.right, y: rect.bottom },
+        { x: rect.left, y: rect.bottom },
+      ]
+      for (const corner of corners) {
+        if (!pointInPolygon(corner.x, corner.y, polygon)) return false
+      }
+      for (let index = 0; index < polygon.length; index += 1) {
+        const next = polygon[(index + 1) % polygon.length]
+        if (segmentHitsRect(polygon[index], next, rect)) return false
       }
       return true
     }
@@ -2115,94 +2310,322 @@ window.__ModuleLoader__.load({
       return route
     }
 
-    /** Rounded SVG path through an axis-aligned polyline. */
-    function roundedPolylinePath(points) {
-      const clean = []
-      for (const point of points) {
-        const last = clean[clean.length - 1]
-        if (last === undefined || last.x !== point.x || last.y !== point.y) clean.push(point)
+    /**
+     * Chaikin corner cutting: each pass replaces a sharp corner with two points
+     * on the adjacent segments. Repeated passes converge to a quadratic
+     * B-spline, so a rectilinear guide becomes a smooth curve without ever
+     * leaving the guide's convex neighbourhood (unlike an interpolating spline,
+     * which can overshoot a corner straight into an obstacle).
+     */
+    function chaikinSmooth(points, iterations) {
+      let current = points.map((point) => ({ x: point.x, y: point.y }))
+      for (let pass = 0; pass < iterations; pass += 1) {
+        if (current.length < 3) return current
+        const next = [current[0]]
+        for (let index = 0; index < current.length - 1; index += 1) {
+          const from = current[index]
+          const to = current[index + 1]
+          next.push(
+            { x: from.x * 0.75 + to.x * 0.25, y: from.y * 0.75 + to.y * 0.25 },
+            { x: from.x * 0.25 + to.x * 0.75, y: from.y * 0.25 + to.y * 0.75 },
+          )
+        }
+        next.push(current[current.length - 1])
+        current = next
       }
-      if (clean.length === 0) return ''
-      if (clean.length === 1) return 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y)
-      let d = 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y)
-      for (let index = 1; index < clean.length; index += 1) {
-        const current = clean[index]
-        if (index === clean.length - 1) {
-          d += ' L ' + round1(current.x) + ' ' + round1(current.y)
-          continue
-        }
-        const before = clean[index - 1]
-        const after = clean[index + 1]
-        const verticalIn = before.x === current.x
-        const verticalOut = after.x === current.x
-        if (verticalIn === verticalOut) {
-          d += ' L ' + round1(current.x) + ' ' + round1(current.y)
-          continue
-        }
-        const radius = Math.min(
-          10,
-          (Math.abs(before.x - current.x) + Math.abs(before.y - current.y)) / 2,
-          (Math.abs(after.x - current.x) + Math.abs(after.y - current.y)) / 2,
-        )
-        if (!(radius >= 1)) {
-          d += ' L ' + round1(current.x) + ' ' + round1(current.y)
-          continue
-        }
-        const inSignX = Math.sign(before.x - current.x)
-        const inSignY = Math.sign(before.y - current.y)
-        const outSignX = Math.sign(after.x - current.x)
-        const outSignY = Math.sign(after.y - current.y)
-        d += ' L ' + round1(current.x + inSignX * radius) + ' ' + round1(current.y + inSignY * radius)
-          + ' Q ' + round1(current.x) + ' ' + round1(current.y)
-          + ' ' + round1(current.x + outSignX * radius) + ' ' + round1(current.y + outSignY * radius)
+      return current
+    }
+
+    /** Keep the endpoints and a bounded number of evenly spread points. */
+    function decimatePolyline(points, limit) {
+      if (points.length <= limit) return points
+      const out = [points[0]]
+      const step = (points.length - 2) / (limit - 2)
+      for (let index = 1; index < limit - 1; index += 1) {
+        out.push(points[Math.min(points.length - 2, Math.round(1 + (index - 1) * step))])
       }
-      return d
+      out.push(points[points.length - 1])
+      return out
     }
 
     /**
-     * Route one edge around the nodes it does not connect. The common case keeps
-     * the smooth curve; a blocked curve becomes a rounded orthogonal detour.
-     * `offset` still separates parallel edges.
+     * Drop interior points that sit almost on top of the previous kept point.
+     * Chaikin leaves clusters at the original corners, and a one-pixel span with
+     * a long control arm would draw a tiny backward loop.
      */
-    function routeAroundObstacles(from, to, offset, obstacles) {
-      const handleFrom = { x: from.x + NODE_W, y: from.y + NODE_H / 2 }
-      const handleTo = { x: to.x, y: to.y + NODE_H / 2 }
-      const rawShift = Number(offset)
-      const shifts = Number.isFinite(rawShift) && rawShift !== 0 ? [rawShift, 0] : [0]
-      // A neighbour placed close to a handle can cover the normal 14px stub;
-      // the shorter stub still leaves the exact card, so try it before giving up.
-      const stubs = EDGE_STUB > 6 ? [EDGE_STUB, 6] : [EDGE_STUB]
-      for (const shift of shifts) {
-        for (const stub of stubs) {
-          const startStub = { x: handleFrom.x + stub, y: handleFrom.y + shift }
-          const endStub = { x: handleTo.x - stub, y: handleTo.y + shift }
-          const startJog = shift === 0
-            ? [handleFrom, startStub]
-            : [handleFrom, { x: startStub.x, y: handleFrom.y }, startStub]
-          const endJog = shift === 0
-            ? [endStub, handleTo]
-            : [endStub, { x: endStub.x, y: handleTo.y }, handleTo]
-          let clear = segmentClear(startJog[0], startJog[1], obstacles)
-          if (clear && startJog.length > 2) clear = segmentClear(startJog[1], startJog[2], obstacles)
-          if (clear) {
-            clear = segmentClear(endJog[0], endJog[1], obstacles)
-            if (clear && endJog.length > 2) clear = segmentClear(endJog[1], endJog[2], obstacles)
-          }
-          if (!clear) continue
-          const route = solveOrthogonalRoute(startStub, endStub, obstacles)
-          if (route === null) continue
-          const points = []
-          const append = (point) => {
-            const last = points[points.length - 1]
-            if (last === undefined || last.x !== point.x || last.y !== point.y) points.push(point)
-          }
-          for (const point of startJog) append(point)
-          for (const point of route) append(point)
-          for (const point of endJog) append(point)
-          return roundedPolylinePath(points)
+    function thinPolyline(points, minGap) {
+      if (points.length < 3) return points
+      const out = [points[0]]
+      for (let index = 1; index < points.length - 1; index += 1) {
+        const previous = out[out.length - 1]
+        if (distanceBetween(previous, points[index]) >= minGap) out.push(points[index])
+      }
+      out.push(points[points.length - 1])
+      return out
+    }
+
+    /** Evenly reduce a sampled polyline; used for cheap pairwise distance checks. */
+    function downsamplePolyline(points, limit) {
+      if (points.length <= limit) return points
+      const out = []
+      const step = (points.length - 1) / (limit - 1)
+      for (let index = 0; index < limit; index += 1) out.push(points[Math.round(index * step)])
+      return out
+    }
+
+    /**
+     * A smooth cubic chain through `points`. Interior tangents follow the
+     * Catmull-Rom construction (scaled by `tension`, so a smoothed guide does
+     * not overshoot its corners); the first and last tangents are horizontal so
+     * the line leaves and enters the card handles cleanly. The emitted path
+     * contains cubic segments only — never a right-angle join.
+     */
+    function smoothCubicChain(points, options = {}) {
+      const tension = Number.isFinite(Number(options.tension)) ? Number(options.tension) : 0.6
+      const stepsPerSegment = Number.isFinite(Number(options.stepsPerSegment)) ? Number(options.stepsPerSegment) : 8
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || last.x !== point.x || last.y !== point.y) clean.push({ x: point.x, y: point.y })
+      }
+      if (clean.length === 0) return null
+      if (clean.length === 1) {
+        return { d: 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y), points: clean }
+      }
+      const segments = []
+      for (let index = 0; index < clean.length - 1; index += 1) {
+        const from = clean[index]
+        const to = clean[index + 1]
+        const before = clean[index - 1] !== undefined
+          ? clean[index - 1]
+          : { x: from.x - (to.x - from.x), y: from.y - (to.y - from.y) }
+        const after = clean[index + 2] !== undefined
+          ? clean[index + 2]
+          : { x: to.x + (to.x - from.x), y: to.y + (to.y - from.y) }
+        segments.push({
+          from,
+          to,
+          c1: {
+            x: from.x + (to.x - before.x) / 6 * tension,
+            y: from.y + (to.y - before.y) / 6 * tension,
+          },
+          c2: {
+            x: to.x - (after.x - from.x) / 6 * tension,
+            y: to.y - (after.y - from.y) / 6 * tension,
+          },
+        })
+      }
+      const first = segments[0]
+      const firstLength = clamp(Math.hypot(first.to.x - first.from.x, first.to.y - first.from.y) * 0.55, 8, 48)
+      first.c1 = { x: first.from.x + firstLength, y: first.from.y }
+      const last = segments[segments.length - 1]
+      const lastLength = clamp(Math.hypot(last.to.x - last.from.x, last.to.y - last.from.y) * 0.55, 8, 48)
+      last.c2 = { x: last.to.x - lastLength, y: last.to.y }
+
+      let d = 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y)
+      const sampled = [{ x: clean[0].x, y: clean[0].y }]
+      for (const segment of segments) {
+        d += ' C ' + round1(segment.c1.x) + ' ' + round1(segment.c1.y)
+          + ', ' + round1(segment.c2.x) + ' ' + round1(segment.c2.y)
+          + ', ' + round1(segment.to.x) + ' ' + round1(segment.to.y)
+        for (let step = 1; step <= stepsPerSegment; step += 1) {
+          sampled.push(cubicPoint(segment.from, segment.to, { c1: segment.c1, c2: segment.c2 }, step / stepsPerSegment))
         }
       }
+      return { d, points: sampled }
+    }
+
+    /** The plain cubic between two handles (the shape used for ghost edges). */
+    function cubicCandidate(from, to, offset) {
+      const controls = curveControls(from, to, offset)
+      const points = [from]
+      for (let step = 1; step <= EDGE_CURVE_STEPS; step += 1) {
+        points.push(cubicPoint(from, to, controls, step / EDGE_CURVE_STEPS))
+      }
+      return { d: curvePath(from, to, offset), points }
+    }
+
+    /** A cubic bowed sideways by `bow` (perpendicular to the straight line). */
+    function bowCandidate(from, to, bow) {
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const length = Math.hypot(dx, dy) || 1
+      const shift = clamp(Number(bow) || 0, -length * 0.55, length * 0.55)
+      const middle = {
+        x: (from.x + to.x) / 2 - (dy / length) * shift,
+        y: (from.y + to.y) / 2 + (dx / length) * shift,
+      }
+      return smoothCubicChain([from, middle, to])
+    }
+
+    /**
+     * Waypoints for a detour: the orthogonal solver only generates a guide
+     * around the obstacle rectangles, and the guide is later smoothed into a
+     * cubic chain, so the right angles never reach the canvas.
+     */
+    function detourGuide(from, to, obstacles, endpointIds, pad = EDGE_GUIDE_PAD, laneShift = 0) {
+      const guideObstacles = obstacles.map((rect) => (
+        rect.nodeId !== undefined && endpointIds.has(rect.nodeId)
+          ? rect
+          : inflateRect(rect, pad)
+      ))
+      const stubs = EDGE_STUB > 6 ? [EDGE_STUB, 6] : [EDGE_STUB]
+      for (const stub of stubs) {
+        const startStub = { x: from.x + stub, y: from.y + laneShift }
+        const endStub = { x: to.x - stub, y: to.y + laneShift }
+        if (!segmentClear(from, startStub, guideObstacles)) continue
+        if (!segmentClear(endStub, to, guideObstacles)) continue
+        const route = solveOrthogonalRoute(startStub, endStub, guideObstacles)
+        if (route === null) continue
+        // The solver omits its synthetic start state, so the first stub point is
+        // prepended explicitly; otherwise the guide starts with a diagonal jump.
+        const waypoints = [from, startStub, ...route, to]
+        return simplifyPolyline(waypoints)
+      }
       return null
+    }
+
+    function candidateClearsObstacles(points, obstacles) {
+      for (let index = 1; index < points.length; index += 1) {
+        if (!segmentClear(points[index - 1], points[index], obstacles)) return false
+      }
+      return true
+    }
+
+    function candidateObstacleHits(points, obstacles) {
+      let hits = 0
+      for (let index = 1; index < points.length; index += 1) {
+        for (const rect of obstacles) {
+          if (segmentHitsRect(points[index - 1], points[index], rect)) hits += 1
+        }
+      }
+      return hits
+    }
+
+    /** Total turning of a sampled polyline; used to prefer calm curves. */
+    function polylineCurvature(points) {
+      let total = 0
+      for (let index = 1; index < points.length - 1; index += 1) {
+        const before = points[index - 1]
+        const current = points[index]
+        const after = points[index + 1]
+        const incoming = Math.atan2(current.y - before.y, current.x - before.x)
+        const outgoing = Math.atan2(after.y - current.y, after.x - current.x)
+        let delta = Math.abs(outgoing - incoming)
+        if (delta > Math.PI) delta = 2 * Math.PI - delta
+        total += delta
+      }
+      return total
+    }
+
+    function scoreEdgeCandidate(candidate, routed) {
+      const points = candidate.points
+      const sampled = downsamplePolyline(points, 24)
+      const box = pointsBoundingBox(points)
+      let separationCost = 0
+      for (const other of routed) {
+        if (!boxesNear(box, other.box, EDGE_SEPARATION)) continue
+        const gap = polylineDistance(sampled, other.points)
+        if (gap >= EDGE_SEPARATION) continue
+        const deficit = EDGE_SEPARATION - gap
+        separationCost += 24 + deficit * deficit * 5
+      }
+      return polylineLength(points) + polylineCurvature(points) * 24 + separationCost
+    }
+
+    function edgeCandidates(from, to, groupOffset, obstacles, endpointIds) {
+      const direct = cubicCandidate(from, to, groupOffset)
+      const candidates = [direct]
+      // Detours are only needed when the direct curve is blocked; otherwise the
+      // sideways bows below cover edge separation without the routing cost.
+      const directBlocked = !candidateClearsObstacles(direct.points, obstacles)
+      const bows = []
+      for (const bow of EDGE_BOWS) {
+        // Same-pair edges keep their extra sideways separation instead of
+        // collapsing back onto the direct curve.
+        const value = bow === 0 ? groupOffset * 1.6 : bow + groupOffset
+        if (bows.some((existing) => Math.abs(existing - value) < 6)) continue
+        bows.push(value)
+      }
+      for (const bow of bows) {
+        const candidate = bowCandidate(from, to, bow)
+        if (candidate !== null) candidates.push(candidate)
+      }
+      if (!directBlocked) return candidates
+      const guidePads = [EDGE_GUIDE_PAD, EDGE_GUIDE_PAD + 18]
+      for (const pad of guidePads) {
+        const guide = detourGuide(from, to, obstacles, endpointIds, pad, groupOffset)
+        if (guide === null) continue
+        const rounded = decimatePolyline(thinPolyline(chaikinSmooth(guide, 2), 12), 14)
+        const smoothed = smoothCubicChain(rounded, { tension: 0.7 })
+        if (smoothed !== null) candidates.push(smoothed)
+      }
+      return candidates
+    }
+
+    function chooseEdgeCandidate(candidates, obstacles, routed) {
+      let best = null
+      let bestScore = Infinity
+      let leastBlocked = null
+      let leastBlockedScore = Infinity
+      for (const candidate of candidates) {
+        const blocked = !candidateClearsObstacles(candidate.points, obstacles)
+        if (blocked) {
+          // Nothing clean is available: keep the least invasive curve so a line
+          // is still drawn instead of dropping it.
+          const blockedScore = candidateObstacleHits(candidate.points, obstacles) * 10000
+            + scoreEdgeCandidate(candidate, routed)
+          if (blockedScore < leastBlockedScore) {
+            leastBlockedScore = blockedScore
+            leastBlocked = candidate
+          }
+          continue
+        }
+        const score = scoreEdgeCandidate(candidate, routed)
+        if (score < bestScore) {
+          bestScore = score
+          best = candidate
+        }
+      }
+      return best !== null ? best : leastBlocked !== null ? leastBlocked : candidates[0]
+    }
+
+    /**
+     * Room around a node handle so several edges leaving one card for different
+     * targets (or arriving from different sources) do not all leave or arrive
+     * at the same point. Edges between the same pair share the same anchor: the
+     * parallel-lane offset separates them along the curve instead.
+     */
+    function edgeAnchorShifts(edges) {
+      const outgoing = {}
+      const incoming = {}
+      for (const edge of edges) {
+        if (outgoing[edge.from] === undefined) outgoing[edge.from] = []
+        outgoing[edge.from].push(edge)
+        if (incoming[edge.to] === undefined) incoming[edge.to] = []
+        incoming[edge.to].push(edge)
+      }
+      const shifts = {}
+      for (const edge of edges) shifts[edge.id] = { from: 0, to: 0 }
+      const assign = (map, key, neighborOf) => {
+        for (const nodeId of Object.keys(map)) {
+          const list = map[nodeId]
+          const neighbors = [...new Set(list.map(neighborOf))].sort()
+          if (neighbors.length < 2) continue
+          const shiftByNeighbor = {}
+          for (let index = 0; index < neighbors.length; index += 1) {
+            shiftByNeighbor[neighbors[index]] = clamp(
+              (index - (neighbors.length - 1) / 2) * EDGE_ANCHOR_STEP,
+              -EDGE_ANCHOR_LIMIT,
+              EDGE_ANCHOR_LIMIT,
+            )
+          }
+          for (const edge of list) shifts[edge.id][key] = shiftByNeighbor[neighborOf(edge)]
+        }
+      }
+      assign(outgoing, 'from', (edge) => edge.to)
+      assign(incoming, 'to', (edge) => edge.from)
+      return shifts
     }
 
     /** Only obstacles near the pair can matter; the rest are cheap to skip. */
@@ -2215,14 +2638,263 @@ window.__ModuleLoader__.load({
         && rect.bottom >= top && rect.top <= bottom)
     }
 
-    function edgePathFor(fromPosition, toPosition, offset, obstacles) {
-      const from = { x: fromPosition.x + NODE_W, y: fromPosition.y + NODE_H / 2 }
-      const to = { x: toPosition.x, y: toPosition.y + NODE_H / 2 }
-      const nearby = nearbyObstacles(obstacles, fromPosition, toPosition)
-      if (curveClearsObstacles(from, to, offset, nearby)) return curvePath(from, to, offset)
-      const routed = routeAroundObstacles(fromPosition, toPosition, offset, nearby)
-      if (routed !== null) return routed
-      return curvePath(from, to, offset)
+    /**
+     * Route every edge once per render. Edges are routed shortest-first so long
+     * edges bend around the short ones, and each chosen curve is fed back as a
+     * soft obstacle for the next one: that is what keeps unrelated edges from
+     * overlapping. Returns `edgeId -> path`.
+     */
+    function routeEdgeSet(edges, positions, softRects, hardRects) {
+      const shifts = edgeAnchorShifts(edges)
+      const groupOffsets = {}
+      const groups = {}
+      for (const edge of edges) {
+        const key = edge.from + '→' + edge.to
+        if (groups[key] === undefined) groups[key] = []
+        groups[key].push(edge)
+      }
+      for (const key of Object.keys(groups)) {
+        const list = groups[key]
+        list.sort((left, right) => String(left.conditionId || '').localeCompare(String(right.conditionId || ''))
+          || left.id.localeCompare(right.id))
+        for (let index = 0; index < list.length; index += 1) {
+          groupOffsets[list[index].id] = list.length > 1
+            ? (index - (list.length - 1) / 2) * 18
+            : 0
+        }
+      }
+
+      const ordered = edges.slice().sort((left, right) => {
+        const leftFrom = positions[left.from]
+        const leftTo = positions[left.to]
+        const rightFrom = positions[right.from]
+        const rightTo = positions[right.to]
+        if (leftFrom === undefined || leftTo === undefined || rightFrom === undefined || rightTo === undefined) {
+          return left.id.localeCompare(right.id)
+        }
+        const leftDistance = Math.hypot(leftTo.x - leftFrom.x, leftTo.y - leftFrom.y)
+        const rightDistance = Math.hypot(rightTo.x - rightFrom.x, rightTo.y - rightFrom.y)
+        return leftDistance - rightDistance || left.id.localeCompare(right.id)
+      })
+
+      const routed = []
+      const paths = {}
+      for (const edge of ordered) {
+        const fromPosition = positions[edge.from]
+        const toPosition = positions[edge.to]
+        if (fromPosition === undefined || toPosition === undefined) continue
+        const shift = shifts[edge.id]
+        const from = { x: fromPosition.x + NODE_W, y: fromPosition.y + NODE_H / 2 + shift.from }
+        const to = { x: toPosition.x, y: toPosition.y + NODE_H / 2 + shift.to }
+        const edgeObstacles = []
+        for (const rect of softRects) {
+          if (rect.nodeId !== edge.from && rect.nodeId !== edge.to) edgeObstacles.push(rect)
+        }
+        for (const rect of hardRects) {
+          if (rect.nodeId === edge.from || rect.nodeId === edge.to) edgeObstacles.push(rect)
+        }
+        const nearby = nearbyObstacles(edgeObstacles, fromPosition, toPosition)
+        const candidates = edgeCandidates(from, to, groupOffsets[edge.id] || 0, nearby, new Set([edge.from, edge.to]))
+        const chosen = chooseEdgeCandidate(candidates, nearby, routed)
+        paths[edge.id] = chosen.d
+        routed.push({ points: downsamplePolyline(chosen.points, 18), box: pointsBoundingBox(chosen.points) })
+      }
+      return paths
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* group outline                                                       */
+    /*                                                                     */
+    /* A group contour follows the union of the grid cells its cards touch. */
+    /* That keeps every contour edge on a layout grid line even in free    */
+    /* layout, and every corner is rounded with the card's own 10px radius. */
+    /* ------------------------------------------------------------------ */
+
+    const GROUP_CORNER_RADIUS = 10
+    const GROUP_LABEL_PAD = 12
+
+    function groupOutlineLoops(cells) {
+      const has = (col, row) => cells.has(col + ',' + row)
+      const segments = []
+      for (const key of cells) {
+        const parts = key.split(',')
+        const col = Number(parts[0])
+        const row = Number(parts[1])
+        if (!has(col, row - 1)) segments.push({ a: { c: col, r: row }, b: { c: col + 1, r: row } })
+        if (!has(col + 1, row)) segments.push({ a: { c: col + 1, r: row }, b: { c: col + 1, r: row + 1 } })
+        if (!has(col, row + 1)) segments.push({ a: { c: col + 1, r: row + 1 }, b: { c: col, r: row + 1 } })
+        if (!has(col - 1, row)) segments.push({ a: { c: col, r: row + 1 }, b: { c: col, r: row } })
+      }
+      const byStart = new Map()
+      for (const segment of segments) {
+        const key = segment.a.c + ',' + segment.a.r
+        if (!byStart.has(key)) byStart.set(key, [])
+        byStart.get(key).push(segment)
+      }
+      const directionOf = (segment) => ({
+        x: Math.sign(segment.b.c - segment.a.c),
+        y: Math.sign(segment.b.r - segment.a.r),
+      })
+      // At a pinch point two cells touch only diagonally and four segments meet.
+      // Taking the sharpest right turn keeps the two loops separate (the
+      // segments are oriented clockwise around their cell block).
+      const pickRightTurn = (current, candidates) => {
+        const incoming = directionOf(current)
+        let best = candidates[0]
+        let bestCross = -Infinity
+        for (const candidate of candidates) {
+          const outgoing = directionOf(candidate)
+          const cross = incoming.x * outgoing.y - incoming.y * outgoing.x
+          if (cross > bestCross) {
+            bestCross = cross
+            best = candidate
+          }
+        }
+        return best
+      }
+
+      const used = new Set()
+      const loops = []
+      for (const segment of segments) {
+        if (used.has(segment)) continue
+        used.add(segment)
+        const loop = [segment.a]
+        const start = segment.a
+        let current = segment
+        for (let guard = 0; guard <= segments.length; guard += 1) {
+          loop.push(current.b)
+          if (current.b.c === start.c && current.b.r === start.r) break
+          const key = current.b.c + ',' + current.b.r
+          const candidates = (byStart.get(key) || []).filter((candidate) => !used.has(candidate))
+          if (candidates.length === 0) break
+          const next = candidates.length === 1 ? candidates[0] : pickRightTurn(current, candidates)
+          used.add(next)
+          current = next
+        }
+        if (loop.length > 1 && loop[0].c === loop[loop.length - 1].c && loop[0].r === loop[loop.length - 1].r) {
+          loop.pop()
+        }
+        if (loop.length >= 4) loops.push(loop)
+      }
+      return loops
+    }
+
+    /** Drop duplicate and collinear vertices from a closed loop. */
+    function simplifyClosedLoop(points) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || last.x !== point.x || last.y !== point.y) clean.push(point)
+      }
+      if (clean.length < 3) return clean
+      const out = []
+      for (let index = 0; index < clean.length; index += 1) {
+        const before = clean[(index - 1 + clean.length) % clean.length]
+        const current = clean[index]
+        const after = clean[(index + 1) % clean.length]
+        const collinear = (before.x === current.x && current.x === after.x)
+          || (before.y === current.y && current.y === after.y)
+        if (!collinear) out.push(current)
+      }
+      return out
+    }
+
+    /**
+     * Closed SVG path through an axis-aligned loop with circular fillets of
+     * `radius` at every corner (drawn with arc commands so the curvature is the
+     * same as the node cards' rounded rectangle).
+     */
+    function roundedRectilinearPath(points, radius) {
+      const clean = simplifyClosedLoop(points)
+      const count = clean.length
+      if (count < 4) return ''
+      const corners = []
+      for (let index = 0; index < count; index += 1) {
+        const previous = clean[(index - 1 + count) % count]
+        const current = clean[index]
+        const next = clean[(index + 1) % count]
+        const incomingLength = distanceBetween(previous, current) || 1
+        const outgoingLength = distanceBetween(current, next) || 1
+        const cornerRadius = Math.min(radius, incomingLength / 2, outgoingLength / 2)
+        const incoming = {
+          x: (current.x - previous.x) / incomingLength,
+          y: (current.y - previous.y) / incomingLength,
+        }
+        const outgoing = {
+          x: (next.x - current.x) / outgoingLength,
+          y: (next.y - current.y) / outgoingLength,
+        }
+        corners.push({
+          entry: { x: current.x - incoming.x * cornerRadius, y: current.y - incoming.y * cornerRadius },
+          exit: { x: current.x + outgoing.x * cornerRadius, y: current.y + outgoing.y * cornerRadius },
+          radius: cornerRadius,
+          cross: incoming.x * outgoing.y - incoming.y * outgoing.x,
+        })
+      }
+      let d = 'M ' + round1(corners[0].entry.x) + ' ' + round1(corners[0].entry.y)
+      for (let index = 0; index < corners.length; index += 1) {
+        const corner = corners[index]
+        if (index > 0) d += ' L ' + round1(corner.entry.x) + ' ' + round1(corner.entry.y)
+        if (corner.radius >= 0.5) {
+          d += ' A ' + round1(corner.radius) + ' ' + round1(corner.radius) + ' 0 0 '
+            + (corner.cross > 0 ? 1 : 0) + ' ' + round1(corner.exit.x) + ' ' + round1(corner.exit.y)
+        } else {
+          d += ' L ' + round1(corner.exit.x) + ' ' + round1(corner.exit.y)
+        }
+      }
+      return d + ' Z'
+    }
+
+    /** One dashed contour per group, plus the bounds used for its label. */
+    function groupOutlineShapes(groups, positions) {
+      const shapes = []
+      for (const group of groups) {
+        const cells = new Set()
+        let memberCount = 0
+        for (const nodeId of group.nodeIds) {
+          const position = positions[nodeId]
+          if (position === undefined) continue
+          memberCount += 1
+          const rect = nodeRect(position)
+          const col0 = Math.floor((rect.left - GRID_X0) / GRID_W)
+          const col1 = Math.floor((rect.right - 1e-6 - GRID_X0) / GRID_W)
+          const row0 = Math.floor((rect.top - GRID_Y0) / GRID_H)
+          const row1 = Math.floor((rect.bottom - 1e-6 - GRID_Y0) / GRID_H)
+          // A corrupt position must not make the cell loop explode.
+          if (col1 - col0 > 48 || row1 - row0 > 48) continue
+          for (let col = col0; col <= col1; col += 1) {
+            for (let row = row0; row <= row1; row += 1) cells.add(col + ',' + row)
+          }
+        }
+        if (memberCount === 0 || cells.size === 0) continue
+        let d = ''
+        let labelBounds = null
+        for (const loop of groupOutlineLoops(cells)) {
+          const world = loop.map((point) => ({
+            x: GRID_X0 + point.c * GRID_W,
+            y: GRID_Y0 + point.r * GRID_H,
+          }))
+          d += roundedRectilinearPath(world, GROUP_CORNER_RADIUS)
+          const bounds = pointsBoundingBox(world)
+          const area = (bounds.right - bounds.left) * (bounds.bottom - bounds.top)
+          if (labelBounds === null || area > labelBounds.area) {
+            labelBounds = Object.assign({ area }, bounds)
+          }
+        }
+        if (d === '' || labelBounds === null) continue
+        shapes.push({ group, d, bounds: labelBounds })
+      }
+      return shapes
+    }
+
+    /** A hand-drawn lasso path, closed for both preview and hit testing. */
+    function closedPolylinePath(points) {
+      if (points.length === 0) return ''
+      let d = 'M ' + round1(points[0].x) + ' ' + round1(points[0].y)
+      for (let index = 1; index < points.length; index += 1) {
+        d += ' L ' + round1(points[index].x) + ' ' + round1(points[index].y)
+      }
+      return d + ' Z'
     }
 
     function formatNextRun(schedule) {
@@ -2764,6 +3436,8 @@ window.__ModuleLoader__.load({
         titleY += 20
       }
 
+      const titleClipId = 'dsh-td-node-clip-' + idFragment(node.id)
+
       return h('g', {
         className: classes.join(' '),
         transform: 'translate(' + round1(position.x) + ' ' + round1(position.y) + ')',
@@ -2771,6 +3445,13 @@ window.__ModuleLoader__.load({
         onDoubleClick: (event) => event.stopPropagation(),
       },
         h('title', null, tooltip),
+        // Anything drawn inside this rounded rectangle is clipped to the card:
+        // a title that still exceeds the fitted width (unusual fonts, zoomed
+        // text) is cut off at the border instead of spilling over it.
+        h('defs', null,
+          h('clipPath', { id: titleClipId },
+            h('rect', { x: 1, y: 1, width: NODE_W - 2, height: NODE_H - 2, rx: 9, ry: 9 })),
+        ),
         h('rect', { className: 'dsh-td-node-bg', x: 0, y: 0, width: NODE_W, height: NODE_H, rx: 10, ry: 10 }),
         h('rect', {
           className: 'dsh-td-node-bar dsh-td-node-bar-' + status,
@@ -2781,11 +3462,21 @@ window.__ModuleLoader__.load({
           rx: 1.75,
           ry: 1.75,
         }),
-        titleElements,
-        h('text', { className: 'dsh-td-node-meta', x: 16, y: 68 }, meta),
-        badgeSlot > 0
-          ? h('text', { className: 'dsh-td-node-chain', x: NODE_W - 12, y: 68, textAnchor: 'end' }, circled(badgeSlot))
-          : null,
+        h('g', { className: 'dsh-td-node-content', clipPath: 'url(#' + titleClipId + ')' },
+          titleElements,
+          h('text', { className: 'dsh-td-node-meta', x: 16, y: 68 }, meta),
+          badgeSlot > 0
+            ? h('text', { className: 'dsh-td-node-chain', x: NODE_W - 12, y: 68, textAnchor: 'end' }, circled(badgeSlot))
+            : null,
+          scheduled
+            ? h('text', {
+              className: 'dsh-td-node-flag',
+              x: NODE_W - 12,
+              y: 22,
+              textAnchor: 'end',
+            }, '⏱')
+            : null,
+        ),
         // The milestone marker lives just above the card and right-aligned with
         // it, so the card itself stays free for title/status content.
         isMilestone
@@ -2795,14 +3486,6 @@ window.__ModuleLoader__.load({
             y: -7,
             textAnchor: 'end',
           }, '里程碑')
-          : null,
-        scheduled
-          ? h('text', {
-            className: 'dsh-td-node-flag',
-            x: NODE_W - 12,
-            y: 22,
-            textAnchor: 'end',
-          }, '⏱')
           : null,
         running ? h('circle', { className: 'dsh-td-breathe', cx: NODE_W - 12, cy: 45, r: 4.5 }) : null,
         h('line', { className: 'dsh-td-handle-line', x1: NODE_W - 4, y1: NODE_H / 2, x2: NODE_W + 1, y2: NODE_H / 2 }),
@@ -2831,6 +3514,7 @@ window.__ModuleLoader__.load({
       const [panning, setPanning] = useState(false)
       const [dragPos, setDragPos] = useState(null)
       const [linkCursor, setLinkCursor] = useState(null)
+      const [lasso, setLasso] = useState(null)
       const [onlyReady, setOnlyReady] = useState(false)
       const fittedRef = useRef(false)
       const viewportRef = useRef(viewport)
@@ -2846,6 +3530,8 @@ window.__ModuleLoader__.load({
         onMoveNode: props.onMoveNode,
         onRequestLink: props.onRequestLink,
         onDeleteEdge: props.onDeleteEdge,
+        onUndo: props.onUndo,
+        onLasso: props.onLasso,
       }
 
       // Keep the optimistic drop frame until the Host snapshot confirms it.
@@ -3010,6 +3696,14 @@ window.__ModuleLoader__.load({
           if (interaction.kind === 'link') {
             const point = toWorld(event.clientX, event.clientY, interaction.viewport)
             setLinkCursor({ from: interaction.from, x: point.x, y: point.y })
+            return
+          }
+          if (interaction.kind === 'lasso') {
+            const point = toWorld(event.clientX, event.clientY, latest.current.viewport)
+            if (distanceBetween(point, interaction.last) < 2.5) return
+            interaction.points.push(point)
+            interaction.last = point
+            setLasso(interaction.points.slice())
           }
         }
 
@@ -3075,7 +3769,7 @@ window.__ModuleLoader__.load({
                 .filter((node) => node.id !== interaction.nodeId)
                 .map((node) => ({ nodeId: node.id, position: assigned[node.id] }))
               setDragPos({ nodeId: interaction.nodeId, x: snapped.x, y: snapped.y, phase: 'drop' })
-              settlePending(handlers.onMoveNode(interaction.nodeId, snapped, displaced))
+              settlePending(handlers.onMoveNode(interaction.nodeId, snapped, displaced, interaction.beforePositions))
               return
             }
             const resolution = resolveNodeLayout(
@@ -3087,7 +3781,17 @@ window.__ModuleLoader__.load({
             const displaced = Object.keys(resolution.moved)
               .map((nodeId) => ({ nodeId, position: resolution.moved[nodeId] }))
             setDragPos({ nodeId: interaction.nodeId, x: position.x, y: position.y, phase: 'drop' })
-            settlePending(handlers.onMoveNode(interaction.nodeId, position, displaced))
+            settlePending(handlers.onMoveNode(interaction.nodeId, position, displaced, interaction.beforePositions))
+            return
+          }
+          if (interaction.kind === 'lasso') {
+            const points = interaction.points
+            setLasso(null)
+            if (points.length < 3) {
+              handlers.onLasso([])
+              return
+            }
+            handlers.onLasso(nodesFullyInside(points))
             return
           }
           if (interaction.kind === 'link') {
@@ -3135,8 +3839,20 @@ window.__ModuleLoader__.load({
             || (target !== null && target !== undefined && target.isContentEditable === true)) return
           const handlers = latest.current
           if (event.key === 'Escape') {
+            if (interactionRef.current !== null && interactionRef.current.kind === 'lasso') {
+              interactionRef.current = null
+              setLasso(null)
+              return
+            }
             handlers.onSelectEdge(null)
             handlers.onSelectNode(null)
+            if (typeof handlers.onSelectGroup === 'function') handlers.onSelectGroup(null)
+            return
+          }
+          if ((event.ctrlKey || event.metaKey) && event.shiftKey !== true
+            && (event.key === 'z' || event.key === 'Z')) {
+            event.preventDefault()
+            if (typeof handlers.onUndo === 'function') handlers.onUndo()
             return
           }
           if ((event.key === 'Delete' || event.key === 'Backspace') && typeof handlers.selectedEdgeId === 'string') {
@@ -3150,6 +3866,12 @@ window.__ModuleLoader__.load({
 
       function startPan(event) {
         if (event.button !== 0) return
+        // Alt + left drag draws a lasso instead of panning: the released shape
+        // selects every node it fully encloses.
+        if (event.altKey) {
+          startLasso(event)
+          return
+        }
         const view = latest.current.viewport
         interactionRef.current = {
           kind: 'pan',
@@ -3161,13 +3883,50 @@ window.__ModuleLoader__.load({
         setPanning(true)
       }
 
+      function startLasso(event) {
+        event.preventDefault()
+        const point = toWorld(event.clientX, event.clientY, latest.current.viewport)
+        interactionRef.current = {
+          kind: 'lasso',
+          points: [point],
+          last: point,
+        }
+        setLasso([point])
+      }
+
+      /** Nodes whose whole card is inside the closed hand-drawn polygon. */
+      function nodesFullyInside(polygon) {
+        const positions = positionsRef.current
+        const nodes = latest.current.model.nodes
+        const selected = []
+        for (const node of nodes) {
+          const position = positions[node.id]
+          if (position === undefined) continue
+          if (rectFullyInsidePolygon(nodeRect(position), polygon)) selected.push(node.id)
+        }
+        return selected
+      }
+
       function startNodeDrag(event, node) {
         if (event.button !== 0) return
+        if (event.altKey) {
+          // The lasso may start on top of a card as well as on empty canvas.
+          event.stopPropagation()
+          startLasso(event)
+          return
+        }
         event.stopPropagation()
         event.preventDefault()
         const origin = positionsRef.current[node.id]
         if (origin === undefined) return
         const view = latest.current.viewport
+        // Snapshot what the user sees now, so undoing the drop restores this
+        // exact arrangement (including the nodes the drag displaced).
+        const beforePositions = {}
+        for (const nodeId of Object.keys(positionsRef.current)) {
+          const point = positionsRef.current[nodeId]
+          beforePositions[nodeId] = { x: point.x, y: point.y }
+        }
         interactionRef.current = {
           kind: 'node',
           nodeId: node.id,
@@ -3176,11 +3935,17 @@ window.__ModuleLoader__.load({
           origin: { x: origin.x, y: origin.y },
           viewport: { x: view.x, y: view.y, scale: view.scale },
           moved: false,
+          beforePositions,
         }
       }
 
       function startLinkDrag(event, nodeId) {
         if (event.button !== 0) return
+        if (event.altKey) {
+          event.stopPropagation()
+          startLasso(event)
+          return
+        }
         event.stopPropagation()
         event.preventDefault()
         const view = latest.current.viewport
@@ -3235,6 +4000,10 @@ window.__ModuleLoader__.load({
       }
       positionsRef.current = positions
 
+      const groupShapes = groupOutlineShapes(model.groups, positions)
+      const lassoHits = lasso !== null ? nodesFullyInside(lasso) : []
+      const lassoPath = lasso !== null ? closedPolylinePath(lasso) : ''
+
       // Node rectangles padded by the routing clearance. Other nodes use the
       // padded rectangle; the edge's own two endpoints use the exact rectangle
       // so the line may touch the handles but may never cut through its own
@@ -3252,36 +4021,29 @@ window.__ModuleLoader__.load({
         ))
       }
 
+      // Every edge is routed together so each curve can steer clear of the
+      // previously routed ones; the result is a pure cubic chain, never an
+      // orthogonal segment.
+      const edgePaths = routeEdgeSet(model.edges, positions, softObstacleRects, hardObstacleRects)
       const edgeElements = []
       for (const edge of model.edges) {
         const fromPos = positions[edge.from]
         const toPos = positions[edge.to]
         if (fromPos === undefined || toPos === undefined) continue
+        const path = edgePaths[edge.id]
+        if (typeof path !== 'string' || path === '') continue
         const active = props.selectedEdgeId === edge.id
         const dimmed = onlyReady && !model.ready.has(edge.from) && !model.ready.has(edge.to)
-        const group = model.edgeGroups[edge.from + '→' + edge.to] || [edge]
-        let index = 0
-        for (let cursor = 0; cursor < group.length; cursor += 1) {
-          if (group[cursor].id === edge.id) {
-            index = cursor
-            break
-          }
-        }
-        const offset = group.length > 1 ? (index - (group.length - 1) / 2) * 18 : 0
-        const edgeObstacles = []
-        for (const rect of softObstacleRects) {
-          if (rect.nodeId !== edge.from && rect.nodeId !== edge.to) edgeObstacles.push(rect)
-        }
-        for (const rect of hardObstacleRects) {
-          if (rect.nodeId === edge.from || rect.nodeId === edge.to) edgeObstacles.push(rect)
-        }
-        const path = edgePathFor(fromPos, toPos, offset, edgeObstacles)
         edgeElements.push(h('g', { key: 'edge:' + edge.id, className: 'dsh-td-edge-group' },
           h('path', {
             className: 'dsh-td-edge-hit',
             d: path,
             onPointerDown: (event) => {
               event.stopPropagation()
+              if (event.altKey) {
+                startLasso(event)
+                return
+              }
               props.onSelectEdge(edge.id)
             },
           }),
@@ -3312,6 +4074,47 @@ window.__ModuleLoader__.load({
           onStartLink: startLinkDrag,
         }))
       }
+
+      // Group contours sit behind edges and cards: they are a container, not a
+      // hit target on top of the graph. The wide transparent stroke picks the
+      // group up when the dashed contour itself is clicked.
+      const groupElements = []
+      for (const shape of groupShapes) {
+        const selected = props.selectedGroupId === shape.group.id
+        groupElements.push(h('g', {
+          key: 'group:' + shape.group.id,
+          className: 'dsh-td-group' + (selected ? ' dsh-td-group-selected' : ''),
+        },
+          h('path', { className: 'dsh-td-group-outline', d: shape.d, fillRule: 'evenodd' }),
+          h('path', {
+            className: 'dsh-td-group-hit',
+            d: shape.d,
+            onPointerDown: (event) => {
+              event.stopPropagation()
+              if (event.altKey) {
+                startLasso(event)
+                return
+              }
+              if (typeof props.onSelectGroup === 'function') props.onSelectGroup(shape.group.id)
+            },
+          }),
+          h('text', {
+            className: 'dsh-td-group-label',
+            x: round1(shape.bounds.left + GROUP_LABEL_PAD),
+            y: round1(shape.bounds.top + 16),
+          }, shape.group.name),
+        ))
+      }
+
+      const lassoElement = lassoPath === ''
+        ? null
+        : h('g', { className: 'dsh-td-lasso-layer' },
+          h('path', { className: 'dsh-td-lasso', d: lassoPath }),
+          h('text', {
+            className: 'dsh-td-lasso-count',
+            x: round1(lasso[0].x + 12),
+            y: round1(lasso[0].y - 10),
+          }, '完全包含 ' + String(lassoHits.length) + ' 个节点'))
 
       let ghostEdge = null
       if (linkCursor !== null) {
@@ -3349,6 +4152,32 @@ window.__ModuleLoader__.load({
             type: 'button',
             className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
             onClick: () => props.onSelectEdge(null),
+          }, '取消'),
+        )
+      }
+
+      const selectedGroup = props.selectedGroupId === null || props.selectedGroupId === undefined
+        ? null
+        : model.groups.find((group) => group.id === props.selectedGroupId) || null
+      let groupBar = null
+      if (selectedGroup !== null) {
+        groupBar = h('div', { className: 'dsh-td-edgebar' },
+          h('span', { className: 'dsh-td-hintline' },
+            '组合：' + selectedGroup.name + ' · ' + String(selectedGroup.nodeIds.length) + ' 个节点'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-td-btn dsh-td-btn-sm',
+            onClick: () => props.onRenameGroup(selectedGroup.id),
+          }, '重命名'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-danger',
+            onClick: () => props.onDeleteGroup(selectedGroup.id),
+          }, '解散组合'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+            onClick: () => props.onSelectGroup(null),
           }, '取消'),
         )
       }
@@ -3419,9 +4248,11 @@ window.__ModuleLoader__.load({
           }),
           h('g', { transform: 'translate(' + round1(viewport.x) + ' ' + round1(viewport.y) + ') scale(' + viewport.scale + ')' },
             gridLayer,
+            groupElements,
             edgeElements,
             ghostEdge,
             nodeElements,
+            lassoElement,
           ),
         ),
         h('div', { className: 'dsh-td-toolbar' },
@@ -3435,6 +4266,17 @@ window.__ModuleLoader__.load({
             onClick: props.onToggleLayoutMode,
           }, props.layoutMode === 'grid' ? '布局模式：网格' : '布局模式：自由'),
           h('button', { type: 'button', className: 'dsh-td-btn dsh-td-btn-sm', onClick: props.onAutoLayout }, '自动布局'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-td-btn dsh-td-btn-sm',
+            disabled: props.canUndo !== true,
+            title: props.canUndo === true
+              ? '撤销上一次拖动或自动布局（Ctrl+Z）'
+              : '没有可撤销的拖动或自动布局',
+            onClick: () => {
+              if (typeof props.onUndo === 'function') props.onUndo()
+            },
+          }, '撤销'),
           h('button', { type: 'button', className: 'dsh-td-btn dsh-td-btn-sm', onClick: fitView }, '适配'),
           h('button', {
             type: 'button',
@@ -3447,8 +4289,10 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text', onClick: () => zoomAt(1.2) }, '＋'),
         ),
         h('div', { className: 'dsh-td-canvas-hint' },
-          '滚轮缩放 · 拖背景平移 · 拖节点移动 · 双击空白新建 · 从节点右侧圆点拖到另一个节点，再选择它满足的前置条件'),
+          '滚轮缩放 · 拖背景平移 · 拖节点移动 · 双击空白新建 · 从节点右侧圆点拖到另一个节点选择前置条件'
+          + ' · Alt+左键圈选节点成组 · Ctrl+Z 撤销拖动/自动布局'),
         edgeBar,
+        groupBar,
       )
     }
 
@@ -3576,6 +4420,101 @@ window.__ModuleLoader__.load({
           ),
         ),
       )
+    }
+
+    /**
+     * Group naming dialog: opens after a lasso encloses at least two nodes, and
+     * again when the selected group is renamed. Confirming is the only way a
+     * group is created or renamed, so the dashed contour never appears with an
+     * empty name.
+     */
+    function GroupNameDialog(props) {
+      const creating = props.mode !== 'rename'
+      const [name, setName] = useState(typeof props.initialName === 'string' ? props.initialName : '')
+      const [submitting, setSubmitting] = useState(false)
+
+      useEffect(() => {
+        function onKeyDown(event) {
+          if (event.key === 'Escape') props.onCancel()
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+      }, [props.onCancel])
+
+      async function confirm() {
+        if (submitting) return
+        const trimmed = name.trim()
+        if (trimmed === '') return
+        setSubmitting(true)
+        try {
+          const result = await props.onConfirm(trimmed)
+          if (result !== null && result !== undefined && result.ok === true) props.onDone()
+        } finally {
+          setSubmitting(false)
+        }
+      }
+
+      return h('div', { className: 'dsh-td-link-layer' },
+        h('div', {
+          className: 'dsh-td-link-card',
+          role: 'dialog',
+          'aria-label': creating ? '给组合命名' : '重命名组合',
+        },
+          h('div', { className: 'dsh-td-link-head' },
+            h('div', null,
+              h('div', { className: 'dsh-td-link-title' }, creating ? '给选中的节点组合命名' : '重命名组合'),
+              h('div', { className: 'dsh-td-link-sub' }, creating
+                ? '已完全包含 ' + String(props.nodeCount) + ' 个节点（仅相交的不计入）。确认后在它们外围画一圈对齐布局网格的虚线轮廓。'
+                : '新名称会显示在虚线轮廓的左上角。')),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text dsh-td-close',
+              title: '取消',
+              onClick: props.onCancel,
+            }, '×'),
+          ),
+          h('input', {
+            className: 'dsh-td-input',
+            type: 'text',
+            value: name,
+            disabled: submitting,
+            maxLength: 60,
+            placeholder: '例如：前端改造',
+            onChange: (event) => setName(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                confirm()
+              }
+            },
+          }),
+          creating && props.hasExistingMembers === true
+            ? h('div', { className: 'dsh-td-hintline' },
+              '部分节点已在别的组合里：确认后它们会从原组合移出，原组合空了自动消失。')
+            : null,
+          h('div', { className: 'dsh-td-link-foot' },
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+              onClick: props.onCancel,
+            }, '取消'),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-primary',
+              disabled: submitting || name.trim() === '',
+              onClick: confirm,
+            }, submitting ? '保存中…' : creating ? '创建组合' : '保存名称'),
+          ),
+        ),
+      )
+    }
+
+    /** First free「组合 N」suggestion, so the dialog opens with a usable name. */
+    function nextGroupName(groups) {
+      const used = new Set((Array.isArray(groups) ? groups : []).map((group) => group.name))
+      let index = (Array.isArray(groups) ? groups.length : 0) + 1
+      while (used.has('组合 ' + String(index))) index += 1
+      return '组合 ' + String(index)
     }
 
     function SessionRow(props) {
@@ -5067,6 +6006,8 @@ window.__ModuleLoader__.load({
         typeof initial.selectedNodeId === 'string' && initial.selectedNodeId !== '' ? initial.selectedNodeId : null,
       )
       const [selectedEdgeId, setSelectedEdgeId] = useState(null)
+      const [selectedGroupId, setSelectedGroupId] = useState(null)
+      const [groupDraft, setGroupDraft] = useState(null)
       const [focusTitle, setFocusTitle] = useState(false)
       const [workspaces, setWorkspaces] = useState({ phase: 'loading', items: [], fallback: false })
       const [state, setState] = useState({ phase: 'idle', snapshot: null, error: null })
@@ -5097,6 +6038,16 @@ window.__ModuleLoader__.load({
       widthRef.current = { left: leftWidth, right: rightWidth }
       const columnDragRef = useRef(null)
       const busy = pending > 0
+
+      // Undo state is declared before the effects that clear it on a workspace
+      // switch; the gesture helpers that fill it live with the canvas callbacks.
+      const undoRef = useRef([])
+      const [undoDepth, setUndoDepth] = useState(0)
+      const dropUndoStack = useCallback(() => {
+        if (undoRef.current.length === 0) return
+        undoRef.current = []
+        setUndoDepth(0)
+      }, [])
 
       const showNotice = useCallback((kind, text) => {
         setNotice({ kind, text })
@@ -5419,6 +6370,9 @@ window.__ModuleLoader__.load({
       }, [loadCatalog])
 
       useEffect(() => {
+        // Position undo is workspace-scoped: a snapshot from another project
+        // must never be posted as positions to this one.
+        dropUndoStack()
         if (workspaceId === null) {
           snapshotRef.current = null
           setState({ phase: 'idle', snapshot: null, error: null })
@@ -5427,7 +6381,7 @@ window.__ModuleLoader__.load({
         snapshotRef.current = null
         setState({ phase: 'loading', snapshot: null, error: null })
         loadState(workspaceId)
-      }, [workspaceId, loadState])
+      }, [workspaceId, loadState, dropUndoStack])
 
       useEffect(() => {
         if (workspaces.phase !== 'ready' || workspaces.items.length === 0) return
@@ -5493,7 +6447,10 @@ window.__ModuleLoader__.load({
         if (state.snapshot === null) return
         if (selectedNodeId !== null && !model.nodeIds.has(selectedNodeId)) setSelectedNodeId(null)
         if (selectedEdgeId !== null && model.edges.every((edge) => edge.id !== selectedEdgeId)) setSelectedEdgeId(null)
-      }, [state.snapshot, model, selectedNodeId, selectedEdgeId])
+        if (selectedGroupId !== null && model.groups.every((group) => group.id !== selectedGroupId)) {
+          setSelectedGroupId(null)
+        }
+      }, [state.snapshot, model, selectedNodeId, selectedEdgeId, selectedGroupId])
 
       const currentWorkspace = useMemo(() => {
         const found = workspaces.items.find((item) => item.workspaceId === workspaceId)
@@ -5524,17 +6481,134 @@ window.__ModuleLoader__.load({
         draftFlushRef.current = typeof flush === 'function' ? flush : null
       }, [])
 
+      // -- undo: drag and auto layout both restore the previous positions ----
+      // Positions live on the Host, so a snapshot of the positions the user saw
+      // is enough to bring the canvas back: undo re-posts them as explicit
+      // coordinates. The stack is per workspace and deliberately in memory.
+      const copyPositions = useCallback((source) => {
+        const snapshot = {}
+        const ids = source !== null && typeof source === 'object' ? Object.keys(source) : []
+        for (const nodeId of ids) {
+          const point = source[nodeId]
+          if (point === null || point === undefined) continue
+          const x = Number(point.x)
+          const y = Number(point.y)
+          if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+          snapshot[nodeId] = { x: Math.round(x), y: Math.round(y) }
+        }
+        return snapshot
+      }, [])
+      const pushUndoEntry = useCallback((label, positions) => {
+        if (positions === null || positions === undefined) return
+        const snapshot = copyPositions(positions)
+        if (Object.keys(snapshot).length === 0) return
+        undoRef.current.push({ label, positions: snapshot })
+        if (undoRef.current.length > UNDO_LIMIT) undoRef.current.shift()
+        setUndoDepth(undoRef.current.length)
+      }, [copyPositions])
+      const handleUndo = useCallback(async () => {
+        const entry = undoRef.current.pop()
+        setUndoDepth(undoRef.current.length)
+        if (entry === undefined) return
+        const positions = []
+        for (const nodeId of Object.keys(entry.positions)) {
+          if (!model.nodeIds.has(nodeId)) continue
+          positions.push({ nodeId, position: entry.positions[nodeId] })
+        }
+        if (positions.length === 0) {
+          showNotice('warn', '这些节点已经不在图里，没有可以撤销的位置')
+          return
+        }
+        flushDrafts()
+        const result = await runAction('set-positions', { positions })
+        if (result !== null && result !== undefined && result.ok === true) {
+          showNotice('info', '已撤销：' + entry.label)
+          return
+        }
+        // The undo did not land (conflict/offline): keep it so the user can retry.
+        undoRef.current.push(entry)
+        setUndoDepth(undoRef.current.length)
+      }, [flushDrafts, model, runAction, showNotice])
+
       const handleSelectNode = useCallback((nodeId) => {
         flushDrafts()
         setSelectedNodeId(typeof nodeId === 'string' && nodeId !== '' ? nodeId : null)
         setSelectedEdgeId(null)
+        setSelectedGroupId(null)
         setFocusTitle(false)
       }, [flushDrafts])
 
       const handleSelectEdge = useCallback((edgeId) => {
         flushDrafts()
         setSelectedEdgeId(edgeId)
+        setSelectedGroupId(null)
       }, [flushDrafts])
+
+      const handleSelectGroup = useCallback((groupId) => {
+        flushDrafts()
+        setSelectedGroupId(typeof groupId === 'string' && groupId !== '' ? groupId : null)
+        setSelectedNodeId(null)
+        setSelectedEdgeId(null)
+        setFocusTitle(false)
+      }, [flushDrafts])
+
+      // -- lasso groups ------------------------------------------------------
+      const handleLasso = useCallback((nodeIds) => {
+        const list = Array.isArray(nodeIds) ? nodeIds.filter((nodeId) => typeof nodeId === 'string' && nodeId !== '') : []
+        if (list.length === 0) {
+          showNotice('warn', '圈选路径里没有完全包含的节点（只碰到边的不计入）')
+          return
+        }
+        if (list.length < 2) {
+          showNotice('warn', '组合至少需要两个节点：请把节点整个圈进去')
+          return
+        }
+        setGroupDraft({ mode: 'create', nodeIds: list })
+      }, [showNotice])
+
+      const handleRenameGroup = useCallback((groupId) => {
+        const group = model.groups.find((item) => item.id === groupId)
+        if (group === undefined) return
+        flushDrafts()
+        setGroupDraft({ mode: 'rename', groupId, initialName: group.name })
+      }, [flushDrafts, model])
+
+      const handleDeleteGroup = useCallback(async (groupId) => {
+        const result = await runAction('delete-group', { groupId })
+        if (result !== null && result !== undefined && result.ok === true) {
+          setSelectedGroupId(null)
+          showNotice('info', '已解散组合，节点本身不变')
+        }
+      }, [runAction, showNotice])
+
+      const handleConfirmGroup = useCallback(async (name) => {
+        const draft = groupDraft
+        if (draft === null) return { ok: false, code: 'no-draft' }
+        if (draft.mode === 'rename') {
+          const result = await runAction('rename-group', { groupId: draft.groupId, name })
+          if (result !== null && result !== undefined && result.ok === true) {
+            showNotice('info', '组合名称已更新为「' + name + '」')
+          }
+          return result
+        }
+        const result = await runAction('create-group', { name, nodeIds: draft.nodeIds })
+        if (result !== null && result !== undefined && result.ok === true) {
+          // Select the group that was just created so its bar (rename/dissolve)
+          // is immediately reachable.
+          const snapshot = result.snapshot
+          const groups = snapshot !== null && snapshot !== undefined
+            && snapshot.graph !== null && typeof snapshot.graph === 'object'
+            && Array.isArray(snapshot.graph.groups)
+            ? snapshot.graph.groups
+            : []
+          const created = groups.find((group) => group.name === name
+            && Array.isArray(group.nodeIds)
+            && group.nodeIds.length === draft.nodeIds.length)
+          if (created !== undefined) setSelectedGroupId(created.id)
+          showNotice('info', '已创建组合「' + name + '」')
+        }
+        return result
+      }, [groupDraft, runAction, showNotice])
 
       const handleCreateNode = useCallback(async (position) => {
         flushDrafts()
@@ -5575,7 +6649,7 @@ window.__ModuleLoader__.load({
         showNotice('info', '已新建任务节点，请在右侧填写标题')
       }, [flushDrafts, runAction, showNotice, layoutMode, model])
 
-      const handleMoveNode = useCallback((nodeId, position, displaced) => {
+      const handleMoveNode = useCallback((nodeId, position, displaced, beforePositions) => {
         if (position === null || position === undefined) return
         const entries = [{
           nodeId,
@@ -5593,8 +6667,19 @@ window.__ModuleLoader__.load({
             })
           }
         }
-        return runAction('set-positions', { positions: entries })
-      }, [runAction])
+        const result = runAction('set-positions', { positions: entries })
+        // Only a landed move becomes undoable: the pre-drag positions are kept
+        // out of the stack while the write is still in flight.
+        if (beforePositions !== null && beforePositions !== undefined
+          && result !== null && typeof result === 'object' && typeof result.then === 'function') {
+          result.then((outcome) => {
+            if (outcome !== null && outcome !== undefined && outcome.ok === true) {
+              pushUndoEntry('拖动节点', beforePositions)
+            }
+          }).catch(() => {})
+        }
+        return result
+      }, [runAction, pushUndoEntry])
 
       // -- linking: drag opens the condition chooser, confirm posts `link` ---
       const handleRequestLink = useCallback((from, to) => {
@@ -5652,6 +6737,11 @@ window.__ModuleLoader__.load({
           ? current.graph
           : null
         const nodes = graph !== null && Array.isArray(graph.nodes) ? graph.nodes : []
+        // Everything the user currently sees, so one undo restores the layout
+        // that existed before the auto layout was requested.
+        const before = copyPositions(layoutMode === 'grid'
+          ? gridAssignments(model.positions, model.nodes)
+          : model.positions)
         if (layoutMode === 'grid') {
           if (nodes.length === 0) {
             showNotice('info', '没有需要布局的节点')
@@ -5663,6 +6753,7 @@ window.__ModuleLoader__.load({
             positions: nodes.map((node) => ({ nodeId: node.id, position: snapped[node.id] })),
           })
           if (result !== null && result !== undefined && result.ok === true) {
+            pushUndoEntry('自动布局', before)
             showNotice('info', '已按网格重新布局')
           }
           return
@@ -5677,9 +6768,10 @@ window.__ModuleLoader__.load({
           positions: moved.map((node) => ({ nodeId: node.id, position: null })),
         })
         if (result !== null && result !== undefined && result.ok === true) {
+          pushUndoEntry('自动布局', before)
           showNotice('info', '已恢复自动布局')
         }
-      }, [layoutMode, runAction, showNotice])
+      }, [layoutMode, model, runAction, showNotice, copyPositions, pushUndoEntry])
 
       const refreshAll = useCallback(() => {
         loadWorkspaces()
@@ -5793,6 +6885,8 @@ window.__ModuleLoader__.load({
               flushDrafts()
               setSelectedNodeId(null)
               setSelectedEdgeId(null)
+              setSelectedGroupId(null)
+              setGroupDraft(null)
               setLinkDraft(null)
               setWorkspaceId(id)
             },
@@ -5813,15 +6907,22 @@ window.__ModuleLoader__.load({
               model,
               selectedNodeId,
               selectedEdgeId,
+              selectedGroupId,
               layoutMode,
               onToggleLayoutMode: toggleLayoutMode,
               onSelectNode: handleSelectNode,
               onSelectEdge: handleSelectEdge,
+              onSelectGroup: handleSelectGroup,
+              onRenameGroup: handleRenameGroup,
+              onDeleteGroup: handleDeleteGroup,
               onMoveNode: handleMoveNode,
               onCreateNode: handleCreateNode,
               onRequestLink: handleRequestLink,
               onDeleteEdge: handleDeleteEdge,
               onAutoLayout: handleAutoLayout,
+              onLasso: handleLasso,
+              onUndo: handleUndo,
+              canUndo: undoDepth > 0,
             }),
             overlay,
             linkDraft !== null
@@ -5833,6 +6934,23 @@ window.__ModuleLoader__.load({
                 onConfirm: handleConfirmLink,
                 onCancel: () => setLinkDraft(null),
                 onDone: () => setLinkDraft(null),
+              })
+              : null,
+            groupDraft !== null
+              ? h(GroupNameDialog, {
+                key: 'group:' + (groupDraft.mode === 'rename'
+                  ? groupDraft.groupId
+                  : groupDraft.nodeIds.join('|')),
+                mode: groupDraft.mode,
+                nodeCount: groupDraft.mode === 'rename' ? 0 : groupDraft.nodeIds.length,
+                initialName: groupDraft.mode === 'rename'
+                  ? groupDraft.initialName
+                  : nextGroupName(model.groups),
+                hasExistingMembers: groupDraft.mode === 'create'
+                  && groupDraft.nodeIds.some((nodeId) => model.groupOfNode[nodeId] !== undefined),
+                onConfirm: handleConfirmGroup,
+                onCancel: () => setGroupDraft(null),
+                onDone: () => setGroupDraft(null),
               })
               : null,
             // Operation feedback belongs to the canvas column and floats above
