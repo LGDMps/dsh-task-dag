@@ -196,6 +196,51 @@ function pointer(window, type, options) {
   }, options))
 }
 
+/** Sample an SVG path made of M/L/Q/C commands into points on the curve. */
+function samplePath(d, perCurve = 32) {
+  const commands = typeof d === 'string' ? d.match(/[MLQC][^MLQC]*/g) || [] : []
+  const points = []
+  let current = { x: 0, y: 0 }
+  for (const command of commands) {
+    const type = command[0]
+    const nums = command.slice(1).trim().split(/[\s,]+/).filter(Boolean).map(Number)
+    if (type === 'M' || type === 'L') {
+      current = { x: nums[0], y: nums[1] }
+      points.push(current)
+      continue
+    }
+    if (type === 'Q') {
+      const control = { x: nums[0], y: nums[1] }
+      const end = { x: nums[2], y: nums[3] }
+      for (let step = 1; step <= perCurve; step += 1) {
+        const t = step / perCurve
+        const mt = 1 - t
+        points.push({
+          x: mt * mt * current.x + 2 * mt * t * control.x + t * t * end.x,
+          y: mt * mt * current.y + 2 * mt * t * control.y + t * t * end.y,
+        })
+      }
+      current = end
+      continue
+    }
+    if (type === 'C') {
+      const c1 = { x: nums[0], y: nums[1] }
+      const c2 = { x: nums[2], y: nums[3] }
+      const end = { x: nums[4], y: nums[5] }
+      for (let step = 1; step <= perCurve; step += 1) {
+        const t = step / perCurve
+        const mt = 1 - t
+        points.push({
+          x: mt * mt * mt * current.x + 3 * mt * mt * t * c1.x + 3 * mt * t * t * c2.x + t * t * t * end.x,
+          y: mt * mt * mt * current.y + 3 * mt * mt * t * c1.y + 3 * mt * t * t * c2.y + t * t * t * end.y,
+        })
+      }
+      current = end
+    }
+  }
+  return points
+}
+
 /**
  * Mount the panel with a mutable graph.
  *
@@ -520,6 +565,18 @@ test('Alt lasso creates a group with a dashed grid-aligned rounded contour', asy
   const dialog = harness.container.querySelector('.dsh-td-link-card')
   assert.ok(dialog, 'the lasso opens the group-name dialog')
   assert.match(dialog.textContent ?? '', /完全包含 2 个节点/, 'only fully enclosed nodes are counted')
+  // The enclosed cards stay highlighted until the dialog is confirmed or
+  // cancelled, so the user can check the selection before naming it.
+  assert.equal(
+    harness.container.querySelectorAll('g.dsh-td-node-group-target').length,
+    2,
+    'the enclosed nodes are highlighted before the group is confirmed',
+  )
+  assert.equal(
+    harness.container.querySelectorAll('rect.dsh-td-node-group-halo').length,
+    2,
+    'each candidate node draws its halo',
+  )
   const input = dialog.querySelector('input.dsh-td-input')
   assert.ok(input, 'the dialog has a name input')
   assert.equal(input.value, '组合 1')
@@ -543,6 +600,11 @@ test('Alt lasso creates a group with a dashed grid-aligned rounded contour', asy
 
   const outlines = [...harness.container.querySelectorAll('path.dsh-td-group-outline')]
   assert.equal(outlines.length, 1, 'one dashed contour is rendered')
+  assert.equal(
+    harness.container.querySelectorAll('g.dsh-td-node-group-target').length,
+    0,
+    'the highlight is dropped once the group exists',
+  )
   const d = outlines[0].getAttribute('d') ?? ''
   assert.match(d, /^M /, 'the contour has path data')
   assert.match(d, /A 10 10 0 0 [01] /, 'every corner uses the card radius (10)')
@@ -613,4 +675,36 @@ test('a lasso with no fully enclosed nodes does not open the dialog', async (t) 
   assert.equal(harness.container.querySelector('.dsh-td-link-card'), null, 'no dialog for a grazing lasso')
   assert.match(harness.container.textContent ?? '', /没有完全包含的节点/, 'the user gets a warning instead')
   assert.equal(harness.container.querySelectorAll('path.dsh-td-group-outline').length, 0)
+})
+
+test('a horizontal edge stays flat when another edge shares its target', async (t) => {
+  // Regression from the ssr workspace: an edge between two cards on the same
+  // row must not arc high above the row just because another edge arrives at
+  // the same target card.
+  const harness = await mountPanel(t, (graph) => {
+    graph.nodes = [
+      node('n_gui', '形态学 GUI 对照工具', 736, 295),
+      node('n_os', 'O/S 双轨算法实现', 1376, 295),
+      node('n_tree', '双轨实验工作树整理与集成基线', 1056, 97),
+    ]
+    graph.edges = [
+      { id: 'e_gui', from: 'n_gui', to: 'n_os', conditionId: 'c_os' },
+      { id: 'e_tree', from: 'n_tree', to: 'n_os', conditionId: 'c_os_2' },
+    ]
+    graph.groups = []
+  })
+  const path = harness.container.querySelector('path[data-edge-id="e_gui"]')
+  assert.ok(path, 'the horizontal edge renders')
+  const d = path.getAttribute('d') ?? ''
+  assert.match(d, /^M [-\d.]+ [-\d.]+ C /, 'it is still a cubic curve')
+  const points = samplePath(d)
+  const ys = points.map((point) => point.y)
+  const verticalRange = Math.max(...ys) - Math.min(...ys)
+  assert.ok(
+    verticalRange <= 14,
+    'the horizontal edge does not arc away from its row (range ' + verticalRange.toFixed(1) + 'px)',
+  )
+  const last = points[points.length - 1]
+  assert.ok(Math.abs(last.x - 1376) < 1, 'it ends at the target card edge')
+  assert.ok(Math.abs(last.y - 337) <= 8, 'it ends near the target handle')
 })

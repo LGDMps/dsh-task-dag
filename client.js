@@ -256,7 +256,10 @@ window.__ModuleLoader__.load({
     const EDGE_ANCHOR_STEP = 10
     const EDGE_ANCHOR_LIMIT = 24
     const EDGE_GUIDE_PAD = 20
-    const EDGE_BOWS = [0, 44, -44, 86, -86]
+    // Gentle sideways alternatives only: a huge bow to dodge a brief crossing
+    // looks worse than the crossing itself, so the amplitudes stay small and
+    // the score below only charges for stretches that actually run alongside.
+    const EDGE_BOWS = [0, 26, -26, 52, -52]
 
     // Text fields save themselves: a quiet delay after typing, on blur, and
     // before the panel switches nodes or unmounts.
@@ -468,6 +471,9 @@ window.__ModuleLoader__.load({
       '.dsh-td-node-emphasis .dsh-td-node-bg{stroke:var(--dsw-alias-state-success-primary);stroke-width:1.6}',
       '.dsh-td-node-dim{opacity:.3}',
       '.dsh-td-node-dragging{cursor:grabbing}',
+      '.dsh-td-node-group-halo{fill:var(--dsw-alias-brand-primary);fill-opacity:.14;stroke:var(--dsw-alias-brand-primary);',
+      'stroke-width:1.6;stroke-dasharray:5 3;pointer-events:none}',
+      '.dsh-td-node-group-target .dsh-td-node-bg{stroke:var(--dsw-alias-brand-primary);stroke-width:1.6}',
       // status colours mirror the task board's `.statusDot` tokens exactly;
       // planned/todo/doing/done/failed each get one theme token.
       '.dsh-td-node-bar-planned{fill:var(--dsw-alias-label-tertiary)}',
@@ -2087,21 +2093,6 @@ window.__ModuleLoader__.load({
         && a.top - gap <= b.bottom && b.top - gap <= a.bottom
     }
 
-    /** Smallest distance between two sampled polylines (0 when they touch). */
-    function polylineDistance(a, b) {
-      let minimum = Infinity
-      for (const point of a) {
-        for (const other of b) {
-          const distance = distanceBetween(point, other)
-          if (distance < minimum) {
-            minimum = distance
-            if (minimum === 0) return 0
-          }
-        }
-      }
-      return minimum
-    }
-
     /** Ray-casting point-in-polygon; the polygon may be open (last closes to first). */
     function pointInPolygon(x, y, polygon) {
       if (polygon.length < 3) return false
@@ -2450,12 +2441,16 @@ window.__ModuleLoader__.load({
       const dx = to.x - from.x
       const dy = to.y - from.y
       const length = Math.hypot(dx, dy) || 1
-      const shift = clamp(Number(bow) || 0, -length * 0.55, length * 0.55)
+      // The bow never dominates the edge: short edges stay almost straight, and
+      // even long ones only bend by a fraction of their own length.
+      const limit = Math.min(80, Math.max(14, length * 0.22))
+      const shift = clamp(Number(bow) || 0, -limit, limit)
       const middle = {
         x: (from.x + to.x) / 2 - (dy / length) * shift,
         y: (from.y + to.y) / 2 + (dx / length) * shift,
       }
-      return smoothCubicChain([from, middle, to])
+      const candidate = smoothCubicChain([from, middle, to])
+      return candidate
     }
 
     /**
@@ -2518,6 +2513,36 @@ window.__ModuleLoader__.load({
       return total
     }
 
+    /**
+     * How much of this candidate runs alongside an already routed edge.
+     *
+     * A crossing only puts one or two samples within the gap and is deliberately
+     * left alone: crossings are readable, while two lines travelling together
+     * are not. Only a sustained parallel stretch accumulates enough close
+     * samples to be worth bending the edge.
+     */
+    function parallelOverlapCost(sampled, otherPoints) {
+      let close = 0
+      let narrowest = Infinity
+      for (const point of sampled) {
+        let nearest = Infinity
+        for (const other of otherPoints) {
+          const distance = distanceBetween(point, other)
+          if (distance < nearest) {
+            nearest = distance
+            if (nearest <= 0.5) break
+          }
+        }
+        if (nearest < EDGE_SEPARATION) {
+          close += 1
+          if (nearest < narrowest) narrowest = nearest
+        }
+      }
+      if (close <= 2) return 0
+      const deficit = Math.max(0, EDGE_SEPARATION - narrowest)
+      return 20 + (close - 2) * 12 + deficit * deficit * 2
+    }
+
     function scoreEdgeCandidate(candidate, routed) {
       const points = candidate.points
       const sampled = downsamplePolyline(points, 24)
@@ -2525,10 +2550,7 @@ window.__ModuleLoader__.load({
       let separationCost = 0
       for (const other of routed) {
         if (!boxesNear(box, other.box, EDGE_SEPARATION)) continue
-        const gap = polylineDistance(sampled, other.points)
-        if (gap >= EDGE_SEPARATION) continue
-        const deficit = EDGE_SEPARATION - gap
-        separationCost += 24 + deficit * deficit * 5
+        separationCost += parallelOverlapCost(sampled, other.points)
       }
       return polylineLength(points) + polylineCurvature(points) * 24 + separationCost
     }
@@ -2542,7 +2564,9 @@ window.__ModuleLoader__.load({
       const bows = []
       for (const bow of EDGE_BOWS) {
         // Same-pair edges keep their extra sideways separation instead of
-        // collapsing back onto the direct curve.
+        // collapsing back onto the direct curve. With no group offset the
+        // zero-bow alternative is just a noisier copy of the direct curve.
+        if (bow === 0 && Math.abs(groupOffset) < 1) continue
         const value = bow === 0 ? groupOffset * 1.6 : bow + groupOffset
         if (bows.some((existing) => Math.abs(existing - value) < 6)) continue
         bows.push(value)
@@ -3400,6 +3424,7 @@ window.__ModuleLoader__.load({
       const badgeSlot = active !== null ? Number(active.slot) : sessions.length > 0 ? Number(sessions[sessions.length - 1].slot) : 0
       const classes = ['dsh-td-node']
       if (props.selected) classes.push('dsh-td-node-selected')
+      if (props.groupTarget) classes.push('dsh-td-node-group-target')
       if (showBlocked) classes.push('dsh-td-node-blocked')
       if (props.dimmed) classes.push('dsh-td-node-dim')
       if (props.emphasized) classes.push('dsh-td-node-emphasis')
@@ -3452,6 +3477,21 @@ window.__ModuleLoader__.load({
           h('clipPath', { id: titleClipId },
             h('rect', { x: 1, y: 1, width: NODE_W - 2, height: NODE_H - 2, rx: 9, ry: 9 })),
         ),
+        // Lasso preview: a halo just outside the card marks the nodes that the
+        // current hand-drawn path fully encloses (and keeps marking them while
+        // the group-name dialog is open). It is drawn behind the card so only
+        // the ring around it shows.
+        props.groupTarget
+          ? h('rect', {
+            className: 'dsh-td-node-group-halo',
+            x: -5,
+            y: -5,
+            width: NODE_W + 10,
+            height: NODE_H + 10,
+            rx: 14,
+            ry: 14,
+          })
+          : null,
         h('rect', { className: 'dsh-td-node-bg', x: 0, y: 0, width: NODE_W, height: NODE_H, rx: 10, ry: 10 }),
         h('rect', {
           className: 'dsh-td-node-bar dsh-td-node-bar-' + status,
@@ -4003,6 +4043,9 @@ window.__ModuleLoader__.load({
       const groupShapes = groupOutlineShapes(model.groups, positions)
       const lassoHits = lasso !== null ? nodesFullyInside(lasso) : []
       const lassoPath = lasso !== null ? closedPolylinePath(lasso) : ''
+      const pendingGroupTargets = new Set(
+        Array.isArray(props.pendingGroupNodeIds) ? props.pendingGroupNodeIds : [],
+      )
 
       // Node rectangles padded by the routing clearance. Other nodes use the
       // padded rectangle; the edge's own two endpoints use the exact rectangle
@@ -4069,6 +4112,7 @@ window.__ModuleLoader__.load({
           selected: props.selectedNodeId === node.id,
           dimmed: onlyReady && !model.ready.has(node.id),
           emphasized: onlyReady && model.ready.has(node.id),
+          groupTarget: pendingGroupTargets.has(node.id) || lassoHits.indexOf(node.id) >= 0,
           dragging: dragPos !== null && dragPos.nodeId === node.id,
           onNodePointerDown: startNodeDrag,
           onStartLink: startLinkDrag,
@@ -6008,6 +6052,9 @@ window.__ModuleLoader__.load({
       const [selectedEdgeId, setSelectedEdgeId] = useState(null)
       const [selectedGroupId, setSelectedGroupId] = useState(null)
       const [groupDraft, setGroupDraft] = useState(null)
+      // Nodes the pending lasso enclosed: highlighted from pointer-up until the
+      // group dialog is confirmed or cancelled.
+      const [pendingGroupIds, setPendingGroupIds] = useState([])
       const [focusTitle, setFocusTitle] = useState(false)
       const [workspaces, setWorkspaces] = useState({ phase: 'loading', items: [], fallback: false })
       const [state, setState] = useState({ phase: 'idle', snapshot: null, error: null })
@@ -6371,8 +6418,12 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         // Position undo is workspace-scoped: a snapshot from another project
-        // must never be posted as positions to this one.
+        // must never be posted as positions to this one. A pending group is
+        // workspace-scoped for the same reason.
         dropUndoStack()
+        setPendingGroupIds([])
+        setGroupDraft(null)
+        setSelectedGroupId(null)
         if (workspaceId === null) {
           snapshotRef.current = null
           setState({ phase: 'idle', snapshot: null, error: null })
@@ -6555,6 +6606,7 @@ window.__ModuleLoader__.load({
       // -- lasso groups ------------------------------------------------------
       const handleLasso = useCallback((nodeIds) => {
         const list = Array.isArray(nodeIds) ? nodeIds.filter((nodeId) => typeof nodeId === 'string' && nodeId !== '') : []
+        setPendingGroupIds(list)
         if (list.length === 0) {
           showNotice('warn', '圈选路径里没有完全包含的节点（只碰到边的不计入）')
           return
@@ -6565,6 +6617,11 @@ window.__ModuleLoader__.load({
         }
         setGroupDraft({ mode: 'create', nodeIds: list })
       }, [showNotice])
+
+      const dropGroupDraft = useCallback(() => {
+        setGroupDraft(null)
+        setPendingGroupIds([])
+      }, [])
 
       const handleRenameGroup = useCallback((groupId) => {
         const group = model.groups.find((item) => item.id === groupId)
@@ -6584,12 +6641,23 @@ window.__ModuleLoader__.load({
       const handleConfirmGroup = useCallback(async (name) => {
         const draft = groupDraft
         if (draft === null) return { ok: false, code: 'no-draft' }
+        const explainFailure = (result) => {
+          // The browser half can be newer than the running Host (a page refresh
+          // updates this file, but the Host bundle only reloads on a DSH
+          // restart). An unknown action then surfaces as a raw protocol error,
+          // which is not actionable on its own.
+          if (result !== null && result !== undefined && result.ok !== true
+            && typeof result.message === 'string' && result.message.includes('不支持的操作')) {
+            showNotice('error', '当前运行的 Host 还是旧版本，重启 DSH 后组合功能才会生效')
+          }
+          return result
+        }
         if (draft.mode === 'rename') {
           const result = await runAction('rename-group', { groupId: draft.groupId, name })
           if (result !== null && result !== undefined && result.ok === true) {
             showNotice('info', '组合名称已更新为「' + name + '」')
           }
-          return result
+          return explainFailure(result)
         }
         const result = await runAction('create-group', { name, nodeIds: draft.nodeIds })
         if (result !== null && result !== undefined && result.ok === true) {
@@ -6605,9 +6673,10 @@ window.__ModuleLoader__.load({
             && Array.isArray(group.nodeIds)
             && group.nodeIds.length === draft.nodeIds.length)
           if (created !== undefined) setSelectedGroupId(created.id)
+          setPendingGroupIds([])
           showNotice('info', '已创建组合「' + name + '」')
         }
-        return result
+        return explainFailure(result)
       }, [groupDraft, runAction, showNotice])
 
       const handleCreateNode = useCallback(async (position) => {
@@ -6887,6 +6956,7 @@ window.__ModuleLoader__.load({
               setSelectedEdgeId(null)
               setSelectedGroupId(null)
               setGroupDraft(null)
+              setPendingGroupIds([])
               setLinkDraft(null)
               setWorkspaceId(id)
             },
@@ -6908,6 +6978,7 @@ window.__ModuleLoader__.load({
               selectedNodeId,
               selectedEdgeId,
               selectedGroupId,
+              pendingGroupNodeIds: pendingGroupIds,
               layoutMode,
               onToggleLayoutMode: toggleLayoutMode,
               onSelectNode: handleSelectNode,
@@ -6949,8 +7020,8 @@ window.__ModuleLoader__.load({
                 hasExistingMembers: groupDraft.mode === 'create'
                   && groupDraft.nodeIds.some((nodeId) => model.groupOfNode[nodeId] !== undefined),
                 onConfirm: handleConfirmGroup,
-                onCancel: () => setGroupDraft(null),
-                onDone: () => setGroupDraft(null),
+                onCancel: dropGroupDraft,
+                onDone: dropGroupDraft,
               })
               : null,
             // Operation feedback belongs to the canvas column and floats above
