@@ -215,14 +215,19 @@ test('milestone is a marker, drafts are flushed, edges avoid unrelated nodes', (
   )
 
   // Edges are smooth cubic chains only: a blocked direct curve becomes a
-  // smoothed detour (the orthogonal solver is an internal guide), and routed
-  // edges steer clear of each other instead of overlapping.
-  assert.match(source, /function smoothCubicChain\(/)
+  // curvature-continuous spline detour (the orthogonal solver is an internal
+  // guide), and routed edges steer clear of each other instead of overlapping.
+  assert.match(source, /function splineChain\(/)
   assert.match(source, /function solveOrthogonalRoute\(/)
   assert.match(source, /function detourGuide\(/)
   assert.match(source, /function routeEdgeSet\(/)
   assert.match(source, /function chaikinSmooth\(/)
+  assert.equal(source.includes('function smoothCubicChain('), false,
+    'the C1-only interpolating chain (visible curvature kinks) must not come back')
   assert.match(source, /const EDGE_CLEARANCE =/)
+  // Group contours include the connection corridors, so a group is one contour.
+  assert.match(source, /function groupConnectionCells\(/)
+  assert.match(source, /const GROUP_EDGE_BUFFER =/)
   assert.match(source, /const EDGE_SEPARATION =/)
 })
 

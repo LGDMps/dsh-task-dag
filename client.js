@@ -887,6 +887,12 @@ window.__ModuleLoader__.load({
       return Math.round(value * 10) / 10
     }
 
+    // Spline control points keep two decimals: rounding them to 0.1 perturbs the
+    // second derivative enough to reintroduce a tiny curvature jump at joins.
+    function round2(value) {
+      return Math.round(value * 100) / 100
+    }
+
     /**
      * Token counts the way the DSH composer's context meter shows them:
      * exact below 1K, one decimal (or integer at >=100) with K, then M.
@@ -2066,6 +2072,20 @@ window.__ModuleLoader__.load({
       return Math.hypot(b.x - a.x, b.y - a.y)
     }
 
+    /** Index of the point nearest to `target` (0 for an empty list). */
+    function nearestPointIndex(points, target) {
+      let best = 0
+      let bestDistance = Infinity
+      for (let index = 0; index < points.length; index += 1) {
+        const distance = distanceBetween(points[index], target)
+        if (distance < bestDistance) {
+          bestDistance = distance
+          best = index
+        }
+      }
+      return best
+    }
+
     function polylineLength(points) {
       let length = 0
       for (let index = 1; index < points.length; index += 1) {
@@ -2365,15 +2385,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * A smooth cubic chain through `points`. Interior tangents follow the
-     * Catmull-Rom construction (scaled by `tension`, so a smoothed guide does
-     * not overshoot its corners); the first and last tangents are horizontal so
-     * the line leaves and enters the card handles cleanly. The emitted path
-     * contains cubic segments only — never a right-angle join.
+     * Clamped cubic spline through `points` (chord-length parameterisation).
+     *
+     * Every span becomes one cubic Bezier segment, and the second derivative is
+     * continuous at every waypoint: a multi-segment detour therefore has no
+     * curvature jump at its joins, which would otherwise read as a kink even
+     * though the tangent is continuous. Both end tangents are horizontal so the
+     * line leaves and enters the card handles cleanly.
      */
-    function smoothCubicChain(points, options = {}) {
-      const tension = Number.isFinite(Number(options.tension)) ? Number(options.tension) : 0.6
-      const stepsPerSegment = Number.isFinite(Number(options.stepsPerSegment)) ? Number(options.stepsPerSegment) : 8
+    function splineChain(points) {
       const clean = []
       for (const point of points) {
         const last = clean[clean.length - 1]
@@ -2383,44 +2403,79 @@ window.__ModuleLoader__.load({
       if (clean.length === 1) {
         return { d: 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y), points: clean }
       }
-      const segments = []
-      for (let index = 0; index < clean.length - 1; index += 1) {
+      if (clean.length === 2) return cubicCandidate(clean[0], clean[1], 0)
+
+      const count = clean.length
+      const spans = []
+      for (let index = 1; index < count; index += 1) spans.push(distanceBetween(clean[index - 1], clean[index]))
+
+      // Solve the tridiagonal system for the second derivatives, one dimension
+      // at a time. The endpoint first derivatives are fixed: unit horizontal.
+      const solve = (values, startSlope, endSlope) => {
+        const last = count - 1
+        const a = new Array(count).fill(0)
+        const b = new Array(count).fill(0)
+        const c = new Array(count).fill(0)
+        const d = new Array(count).fill(0)
+        b[0] = 2
+        c[0] = 1
+        d[0] = 6 / spans[0] * ((values[1] - values[0]) / spans[0] - startSlope)
+        for (let index = 1; index < last; index += 1) {
+          a[index] = spans[index - 1]
+          b[index] = 2 * (spans[index - 1] + spans[index])
+          c[index] = spans[index]
+          d[index] = 6 * ((values[index + 1] - values[index]) / spans[index]
+            - (values[index] - values[index - 1]) / spans[index - 1])
+        }
+        a[last] = 1
+        b[last] = 2
+        d[last] = 6 / spans[last - 1] * (endSlope - (values[last] - values[last - 1]) / spans[last - 1])
+        for (let index = 1; index <= last; index += 1) {
+          const factor = a[index] / b[index - 1]
+          b[index] -= factor * c[index - 1]
+          d[index] -= factor * d[index - 1]
+        }
+        const second = new Array(count)
+        second[last] = d[last] / b[last]
+        for (let index = last - 1; index >= 0; index -= 1) {
+          second[index] = (d[index] - c[index] * second[index + 1]) / b[index]
+        }
+        const first = new Array(count)
+        for (let index = 0; index < last; index += 1) {
+          first[index] = (values[index + 1] - values[index]) / spans[index]
+            - spans[index] * (2 * second[index] + second[index + 1]) / 6
+        }
+        first[last] = (values[last] - values[last - 1]) / spans[last - 1]
+          + spans[last - 1] * (second[last - 1] + 2 * second[last]) / 6
+        first[0] = startSlope
+        first[last] = endSlope
+        return first
+      }
+
+      const xs = clean.map((point) => point.x)
+      const ys = clean.map((point) => point.y)
+      const slopeX = solve(xs, 1, 1)
+      const slopeY = solve(ys, 0, 0)
+
+      let d = 'M ' + round2(clean[0].x) + ' ' + round2(clean[0].y)
+      const sampled = [{ x: clean[0].x, y: clean[0].y }]
+      for (let index = 0; index < count - 1; index += 1) {
+        const span = spans[index]
         const from = clean[index]
         const to = clean[index + 1]
-        const before = clean[index - 1] !== undefined
-          ? clean[index - 1]
-          : { x: from.x - (to.x - from.x), y: from.y - (to.y - from.y) }
-        const after = clean[index + 2] !== undefined
-          ? clean[index + 2]
-          : { x: to.x + (to.x - from.x), y: to.y + (to.y - from.y) }
-        segments.push({
-          from,
-          to,
-          c1: {
-            x: from.x + (to.x - before.x) / 6 * tension,
-            y: from.y + (to.y - before.y) / 6 * tension,
-          },
-          c2: {
-            x: to.x - (after.x - from.x) / 6 * tension,
-            y: to.y - (after.y - from.y) / 6 * tension,
-          },
-        })
-      }
-      const first = segments[0]
-      const firstLength = clamp(Math.hypot(first.to.x - first.from.x, first.to.y - first.from.y) * 0.55, 8, 48)
-      first.c1 = { x: first.from.x + firstLength, y: first.from.y }
-      const last = segments[segments.length - 1]
-      const lastLength = clamp(Math.hypot(last.to.x - last.from.x, last.to.y - last.from.y) * 0.55, 8, 48)
-      last.c2 = { x: last.to.x - lastLength, y: last.to.y }
-
-      let d = 'M ' + round1(clean[0].x) + ' ' + round1(clean[0].y)
-      const sampled = [{ x: clean[0].x, y: clean[0].y }]
-      for (const segment of segments) {
-        d += ' C ' + round1(segment.c1.x) + ' ' + round1(segment.c1.y)
-          + ', ' + round1(segment.c2.x) + ' ' + round1(segment.c2.y)
-          + ', ' + round1(segment.to.x) + ' ' + round1(segment.to.y)
-        for (let step = 1; step <= stepsPerSegment; step += 1) {
-          sampled.push(cubicPoint(segment.from, segment.to, { c1: segment.c1, c2: segment.c2 }, step / stepsPerSegment))
+        const c1 = {
+          x: from.x + span / 3 * slopeX[index],
+          y: from.y + span / 3 * slopeY[index],
+        }
+        const c2 = {
+          x: to.x - span / 3 * slopeX[index + 1],
+          y: to.y - span / 3 * slopeY[index + 1],
+        }
+        d += ' C ' + round2(c1.x) + ' ' + round2(c1.y)
+          + ', ' + round2(c2.x) + ' ' + round2(c2.y)
+          + ', ' + round2(to.x) + ' ' + round2(to.y)
+        for (let step = 1; step <= 8; step += 1) {
+          sampled.push(cubicPoint(from, to, { c1, c2 }, step / 8))
         }
       }
       return { d, points: sampled }
@@ -2436,21 +2491,16 @@ window.__ModuleLoader__.load({
       return { d: curvePath(from, to, offset), points }
     }
 
-    /** A cubic bowed sideways by `bow` (perpendicular to the straight line). */
+    /** A single cubic bowed sideways by `bow` (perpendicular to the chord). */
     function bowCandidate(from, to, bow) {
-      const dx = to.x - from.x
-      const dy = to.y - from.y
-      const length = Math.hypot(dx, dy) || 1
+      const length = Math.hypot(to.x - from.x, to.y - from.y) || 1
       // The bow never dominates the edge: short edges stay almost straight, and
       // even long ones only bend by a fraction of their own length.
       const limit = Math.min(80, Math.max(14, length * 0.22))
       const shift = clamp(Number(bow) || 0, -limit, limit)
-      const middle = {
-        x: (from.x + to.x) / 2 - (dy / length) * shift,
-        y: (from.y + to.y) / 2 + (dx / length) * shift,
-      }
-      const candidate = smoothCubicChain([from, middle, to])
-      return candidate
+      // One cubic, not a chain: a two-segment chain is only C1 continuous, and
+      // the curvature jump at the joint reads as a visible kink on screen.
+      return cubicCandidate(from, to, shift)
     }
 
     /**
@@ -2464,7 +2514,10 @@ window.__ModuleLoader__.load({
           ? rect
           : inflateRect(rect, pad)
       ))
-      const stubs = EDGE_STUB > 6 ? [EDGE_STUB, 6] : [EDGE_STUB]
+      // A longer first/last stub gives the smoothed curve room to turn: a 14px
+      // stub forces almost the whole bend into the first few pixels, which reads
+      // as a little hook right at the handle.
+      const stubs = [46, EDGE_STUB, 6]
       for (const stub of stubs) {
         const startStub = { x: from.x + stub, y: from.y + laneShift }
         const endStub = { x: to.x - stub, y: to.y + laneShift }
@@ -2473,9 +2526,13 @@ window.__ModuleLoader__.load({
         const route = solveOrthogonalRoute(startStub, endStub, guideObstacles)
         if (route === null) continue
         // The solver omits its synthetic start state, so the first stub point is
-        // prepended explicitly; otherwise the guide starts with a diagonal jump.
-        const waypoints = [from, startStub, ...route, to]
-        return simplifyPolyline(waypoints)
+        // prepended explicitly. The end stub is the last point of `route`; both
+        // stubs are kept so the caller can hand the spline a clean horizontal
+        // first/last span (a collinear end stub would otherwise be simplified
+        // away and the curve would hook right next to the handle).
+        const waypoints = simplifyPolyline([from, startStub, ...route])
+        waypoints.push(to)
+        return waypoints
       }
       return null
     }
@@ -2577,12 +2634,29 @@ window.__ModuleLoader__.load({
       }
       if (!directBlocked) return candidates
       const guidePads = [EDGE_GUIDE_PAD, EDGE_GUIDE_PAD + 18]
+      // Two smoothing strengths: the heavier pass turns the orthogonal guide
+      // into a round arc instead of a right angle with rounded corners, while
+      // the lighter pass stays valid when a card sits close to the detour.
       for (const pad of guidePads) {
         const guide = detourGuide(from, to, obstacles, endpointIds, pad, groupOffset)
-        if (guide === null) continue
-        const rounded = decimatePolyline(thinPolyline(chaikinSmooth(guide, 2), 12), 14)
-        const smoothed = smoothCubicChain(rounded, { tension: 0.7 })
-        if (smoothed !== null) candidates.push(smoothed)
+        if (guide === null || guide.length < 2) continue
+        const startStub = guide[1]
+        const endStub = guide[guide.length - 2]
+        for (const passes of [2, 4]) {
+          // Dense points keep the spline close to the smoothed guide: a sparse
+          // sample lets the interpolation bulge outside a corner (visible as a
+          // sag) and drop the horizontal stub next to the handle.
+          const rounded = decimatePolyline(thinPolyline(chaikinSmooth(guide, passes), 8), 24)
+          const startIndex = nearestPointIndex(rounded, startStub)
+          const endIndex = nearestPointIndex(rounded, endStub)
+          const inner = startIndex < endIndex ? rounded.slice(startIndex + 1, endIndex) : []
+          // Explicit horizontal stubs keep both ends from hooking at the handle.
+          const chain = [from, startStub, ...inner, endStub, to]
+          // The spline (not an interpolating C1 chain) keeps the curvature
+          // continuous at every join, so the detour has no visible kinks.
+          const smoothed = splineChain(chain)
+          if (smoothed !== null) candidates.push(smoothed)
+        }
       }
       return candidates
     }
@@ -2869,16 +2943,106 @@ window.__ModuleLoader__.load({
       return d + ' Z'
     }
 
+    // A group contour follows the grid cells its cards occupy plus the cells the
+    // connections between members pass through. Without the connection cells a
+    // group whose members sit in non-adjacent cells would be drawn as several
+    // separate contours.
+    const GROUP_EDGE_BUFFER = 18
+
+    function cellKeyAt(x, y) {
+      return Math.floor((x - GRID_X0) / GRID_W) + ',' + Math.floor((y - GRID_Y0) / GRID_H)
+    }
+
+    /** Mark every grid cell a buffered segment passes through. */
+    function addSegmentCells(cells, start, end, buffer) {
+      const dx = end.x - start.x
+      const dy = end.y - start.y
+      const length = Math.hypot(dx, dy)
+      if (!(length > 0)) {
+        cells.add(cellKeyAt(start.x, start.y))
+        return
+      }
+      const normalX = -dy / length
+      const normalY = dx / length
+      const steps = Math.max(1, Math.min(400, Math.ceil(length / 10)))
+      const offsets = buffer > 0 ? [0, buffer, -buffer] : [0]
+      for (let step = 0; step <= steps; step += 1) {
+        const t = step / steps
+        const x = start.x + dx * t
+        const y = start.y + dy * t
+        for (const offset of offsets) {
+          cells.add(cellKeyAt(x + normalX * offset, y + normalY * offset))
+        }
+      }
+    }
+
+    /**
+     * Cells that connect the members with each other: every edge whose two
+     * endpoints are both in the group, then one simulated link per remaining
+     * component (closest pair of members), so an isolated member or a cluster
+     * without internal edges still shares a single contour with the rest.
+     */
+    function groupConnectionCells(memberIds, positions, edges) {
+      const cells = new Set()
+      if (memberIds.length < 2) return cells
+      const index = new Map(memberIds.map((nodeId, offset) => [nodeId, offset]))
+      const centers = memberIds.map((nodeId) => ({
+        x: positions[nodeId].x + NODE_W / 2,
+        y: positions[nodeId].y + NODE_H / 2,
+      }))
+      const parent = memberIds.map((_, offset) => offset)
+      const find = (value) => {
+        let root = value
+        while (parent[root] !== root) root = parent[root]
+        let cursor = value
+        while (parent[cursor] !== root) {
+          const next = parent[cursor]
+          parent[cursor] = root
+          cursor = next
+        }
+        return root
+      }
+      const unite = (left, right) => {
+        const leftRoot = find(left)
+        const rightRoot = find(right)
+        if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot
+      }
+      for (const edge of Array.isArray(edges) ? edges : []) {
+        if (edge === null || typeof edge !== 'object') continue
+        if (!index.has(edge.from) || !index.has(edge.to)) continue
+        const fromIndex = index.get(edge.from)
+        const toIndex = index.get(edge.to)
+        addSegmentCells(cells, centers[fromIndex], centers[toIndex], GROUP_EDGE_BUFFER)
+        unite(fromIndex, toIndex)
+      }
+      for (let guard = 0; guard < memberIds.length; guard += 1) {
+        let best = null
+        for (let left = 0; left < memberIds.length; left += 1) {
+          for (let right = left + 1; right < memberIds.length; right += 1) {
+            if (find(left) === find(right)) continue
+            const distance = distanceBetween(centers[left], centers[right])
+            if (best === null || distance < best.distance - 1e-9) {
+              best = { left, right, distance }
+            }
+          }
+        }
+        if (best === null) break
+        addSegmentCells(cells, centers[best.left], centers[best.right], GROUP_EDGE_BUFFER)
+        unite(best.left, best.right)
+      }
+      return cells
+    }
+
     /** One dashed contour per group, plus the bounds used for its label. */
-    function groupOutlineShapes(groups, positions) {
+    function groupOutlineShapes(groups, positions, edges) {
       const shapes = []
       for (const group of groups) {
         const cells = new Set()
-        let memberCount = 0
+        const memberIds = []
         for (const nodeId of group.nodeIds) {
           const position = positions[nodeId]
           if (position === undefined) continue
-          memberCount += 1
+          memberIds.push(nodeId)
           const rect = nodeRect(position)
           const col0 = Math.floor((rect.left - GRID_X0) / GRID_W)
           const col1 = Math.floor((rect.right - 1e-6 - GRID_X0) / GRID_W)
@@ -2890,7 +3054,10 @@ window.__ModuleLoader__.load({
             for (let row = row0; row <= row1; row += 1) cells.add(col + ',' + row)
           }
         }
-        if (memberCount === 0 || cells.size === 0) continue
+        if (memberIds.length === 0 || cells.size === 0) continue
+        // Add the corridor cells that connect the members, so a group is drawn
+        // as one contour even when its cards are not in adjacent cells.
+        for (const key of groupConnectionCells(memberIds, positions, edges)) cells.add(key)
         let d = ''
         let labelBounds = null
         for (const loop of groupOutlineLoops(cells)) {
@@ -4040,7 +4207,7 @@ window.__ModuleLoader__.load({
       }
       positionsRef.current = positions
 
-      const groupShapes = groupOutlineShapes(model.groups, positions)
+      const groupShapes = groupOutlineShapes(model.groups, positions, model.edges)
       const lassoHits = lasso !== null ? nodesFullyInside(lasso) : []
       const lassoPath = lasso !== null ? closedPolylinePath(lasso) : ''
       const pendingGroupTargets = new Set(

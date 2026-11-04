@@ -145,6 +145,55 @@ function insideNode(point, position) {
     && point.y > position.y + 1 && point.y < position.y + NODE_H - 1
 }
 
+/**
+ * Largest curvature jump between adjacent cubic segments of a path.
+ *
+ * A C1-only chain (tangent continuous, curvature not) is what reads as a visible
+ * kink; the detour spline must keep this number tiny.
+ */
+function maxCurvatureJump(d) {
+  const commands = typeof d === 'string' ? d.match(/[MLC][^MLC]*/g) || [] : []
+  const segments = []
+  let current = { x: 0, y: 0 }
+  for (const command of commands) {
+    const type = command[0]
+    const nums = command.slice(1).trim().split(/[\s,]+/).filter(Boolean).map(Number)
+    if (type === 'M') {
+      current = { x: nums[0], y: nums[1] }
+      continue
+    }
+    if (type === 'C') {
+      segments.push({
+        p0: current,
+        c1: { x: nums[0], y: nums[1] },
+        c2: { x: nums[2], y: nums[3] },
+        p1: { x: nums[4], y: nums[5] },
+      })
+      current = { x: nums[4], y: nums[5] }
+    }
+  }
+  const curvature = (segment, t) => {
+    const mt = 1 - t
+    const vx = 3 * mt * mt * (segment.c1.x - segment.p0.x)
+      + 6 * mt * t * (segment.c2.x - segment.c1.x)
+      + 3 * t * t * (segment.p1.x - segment.c2.x)
+    const vy = 3 * mt * mt * (segment.c1.y - segment.p0.y)
+      + 6 * mt * t * (segment.c2.y - segment.c1.y)
+      + 3 * t * t * (segment.p1.y - segment.c2.y)
+    const ax = 6 * mt * (segment.c2.x - 2 * segment.c1.x + segment.p0.x)
+      + 6 * t * (segment.p1.x - 2 * segment.c2.x + segment.c1.x)
+    const ay = 6 * mt * (segment.c2.y - 2 * segment.c1.y + segment.p0.y)
+      + 6 * t * (segment.p1.y - 2 * segment.c2.y + segment.c1.y)
+    return Math.abs(vx * ay - vy * ax) / Math.pow(vx * vx + vy * vy, 1.5)
+  }
+  let maximum = 0
+  for (let index = 1; index < segments.length; index += 1) {
+    const jump = Math.abs(curvature(segments[index - 1], 1) - curvature(segments[index], 0))
+    if (jump > maximum) maximum = jump
+  }
+  return maximum
+}
+
 class FakeEventSource {
   constructor() {
     this.readyState = 1
@@ -296,6 +345,9 @@ test('an edge routes around a node it does not connect', async (t) => {
     const last = points[points.length - 1]
     assert.ok(Math.abs(last.x - endHandle.x) < 0.6 && Math.abs(last.y - endHandle.y) < 0.6,
       'the edge still ends at the target handle')
+    const jump = maxCurvatureJump(d)
+    assert.ok(jump <= 0.005,
+      'the detour keeps curvature continuous across its segments (jump ' + jump.toFixed(5) + ')')
   }
 
   const first = paths[0].getAttribute('d')

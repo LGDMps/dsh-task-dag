@@ -677,6 +677,86 @@ test('a lasso with no fully enclosed nodes does not open the dialog', async (t) 
   assert.equal(harness.container.querySelectorAll('path.dsh-td-group-outline').length, 0)
 })
 
+/** Bounds of a rounded-rectilinear contour path (M/L and arc endpoints). */
+function contourBounds(d) {
+  const points = []
+  for (const segment of (typeof d === 'string' ? d : '').match(/[MLAZ][^MLAZ]*/g) ?? []) {
+    const numbers = segment.slice(1).trim().split(/[\s,]+/).filter(Boolean).map(Number)
+    if (segment[0] === 'M' || segment[0] === 'L') points.push({ x: numbers[0], y: numbers[1] })
+    else if (segment[0] === 'A') points.push({ x: numbers[5], y: numbers[6] })
+  }
+  return {
+    points,
+    subpaths: ((typeof d === 'string' ? d : '').match(/\bM\b/g) ?? []).length,
+    minX: Math.min(...points.map((point) => point.x)),
+    maxX: Math.max(...points.map((point) => point.x)),
+    minY: Math.min(...points.map((point) => point.y)),
+    maxY: Math.max(...points.map((point) => point.y)),
+  }
+}
+
+/**
+ * Mount the panel with one group whose members are passed in, then return the
+ * rendered contour path. Positions are deliberately grid-cell positions so the
+ * expected cells are exact.
+ */
+async function mountWithGroup(t, nodeSpecs, groupNodeIds, edges) {
+  const harness = await mountPanel(t, (graph) => {
+    graph.nodes = nodeSpecs
+    graph.edges = edges
+    graph.groups = [{
+      id: 'g_00000001',
+      name: '跨格组合',
+      nodeIds: groupNodeIds,
+      createdAt: NOW,
+      updatedAt: NOW,
+    }]
+  })
+  const outline = harness.container.querySelector('path.dsh-td-group-outline')
+  assert.ok(outline, 'the group contour renders')
+  return { harness, outline, bounds: contourBounds(outline.getAttribute('d') ?? '') }
+}
+
+test('a group whose cards are in non-adjacent cells is one connected contour', async (t) => {
+  const { bounds } = await mountWithGroup(
+    t,
+    [
+      node('n_left', '左侧节点', 96, 97),
+      node('n_right', '右侧节点', 736, 97),
+    ],
+    ['n_left', 'n_right'],
+    [{ id: 'e_link', from: 'n_left', to: 'n_right', conditionId: 'c_right' }],
+  )
+  // Cells 0..2 are joined by the internal edge corridor: one subpath spanning
+  // 40..1000 instead of two separate boxes around each card.
+  assert.equal(bounds.subpaths, 1, 'the contour is a single connected outline')
+  assert.equal(bounds.minX, 40)
+  assert.equal(bounds.maxX, 1000)
+  assert.equal(bounds.minY, 40)
+  assert.equal(bounds.maxY, 238)
+})
+
+test('a member without any internal edge is still joined into the contour', async (t) => {
+  const { bounds } = await mountWithGroup(
+    t,
+    [
+      node('n_top_left', '上左节点', 96, 97),
+      node('n_top_right', '上右节点', 736, 97),
+      node('n_far_below', '下方孤立节点', 96, 691),
+    ],
+    ['n_top_left', 'n_top_right', 'n_far_below'],
+    // Only the top pair is connected: the far-below node has no edge at all and
+    // must be joined by a simulated link to its nearest member.
+    [{ id: 'e_top', from: 'n_top_left', to: 'n_top_right', conditionId: 'c_right' }],
+  )
+  assert.equal(bounds.subpaths, 1, 'the isolated member does not get a second contour')
+  assert.equal(bounds.minX, 40)
+  assert.equal(bounds.maxX, 1000)
+  // Cells rows 0..3 (the far-below card occupies row 3).
+  assert.equal(bounds.minY, 40)
+  assert.equal(bounds.maxY, 832)
+})
+
 test('a horizontal edge stays flat when another edge shares its target', async (t) => {
   // Regression from the ssr workspace: an edge between two cards on the same
   // row must not arc high above the row just because another edge arrives at
