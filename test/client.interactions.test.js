@@ -6,8 +6,9 @@
  *   2. a manual node drag can be undone back to the pre-drag positions;
  *   3. an auto layout can be undone back to the pre-layout positions;
  *   4. Alt + left drag draws a lasso, selects only fully enclosed nodes, opens
- *      the group-name dialog, posts `create-group`, and renders a dashed
- *      grid-aligned contour whose corners use the card radius.
+ *      the group-name dialog, posts `create-group`, and renders one dashed
+ *      contour whose corners use the card radius and whose corridor follows the
+ *      routed edges.
  *
  * The panel is mounted against a mutable in-memory graph, so action responses
  * behave like the Host's snapshots (positions/groups applied, revision bumped).
@@ -528,7 +529,7 @@ test('an auto layout can be undone back to the pre-layout positions', async (t) 
   assert.deepEqual(harness.nodeTransform('终点任务'), original.b, 'the card returns to its pre-layout spot')
 })
 
-test('Alt lasso creates a group with a dashed grid-aligned rounded contour', async (t) => {
+test('Alt lasso creates a group with a dashed rounded contour', async (t) => {
   const harness = await mountPanel(t)
 
   // A hand-drawn path that fully contains n_a and n_b but only approaches n_c.
@@ -695,6 +696,19 @@ function contourBounds(d) {
   }
 }
 
+/** Point-in-polygon for a contour sampled into its corner points. */
+function polygonContains(points, x, y) {
+  let inside = false
+  for (let index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+    const current = points[index]
+    const before = points[previous]
+    if ((current.y > y) === (before.y > y)) continue
+    const xAtY = ((before.x - current.x) * (y - current.y)) / (before.y - current.y) + current.x
+    if (x < xAtY) inside = !inside
+  }
+  return inside
+}
+
 /**
  * Mount the panel with one group whose members are passed in, then return the
  * rendered contour path. Positions are deliberately grid-cell positions so the
@@ -727,8 +741,8 @@ test('a group whose cards are in non-adjacent cells is one connected contour', a
     ['n_left', 'n_right'],
     [{ id: 'e_link', from: 'n_left', to: 'n_right', conditionId: 'c_right' }],
   )
-  // Cells 0..2 are joined by the internal edge corridor: one subpath spanning
-  // 40..1000 instead of two separate boxes around each card.
+  // The internal edge corridor joins the two card-cell blocks: one subpath
+  // instead of two separate boxes around each card.
   assert.equal(bounds.subpaths, 1, 'the contour is a single connected outline')
   assert.equal(bounds.minX, 40)
   assert.equal(bounds.maxX, 1000)
@@ -755,6 +769,32 @@ test('a member without any internal edge is still joined into the contour', asyn
   // Cells rows 0..3 (the far-below card occupies row 3).
   assert.equal(bounds.minY, 40)
   assert.equal(bounds.maxY, 832)
+})
+
+test('a connection corridor follows the routed edge and skips unrelated cards', async (t) => {
+  // The reported example: the edge from 新任务2 to 新任务3 is blocked by
+  // 新任务1, and 新任务4 sits near the straight line. The narrow corridor must
+  // follow the routed (bowed) edge, not claim whole grid cells.
+  const start = node('n_start', '新任务2', 416, 493)
+  const goal = node('n_goal', '新任务3', 1056, 691)
+  const blocker = node('n_blocker', '新任务 1', 736, 493)
+  const other = node('n_other', '新任务 4', 416, 691)
+  const { bounds } = await mountWithGroup(
+    t,
+    [start, goal, blocker, other],
+    ['n_start', 'n_goal'],
+    [{ id: 'e_link', from: 'n_start', to: 'n_goal', conditionId: 'c_goal' }],
+  )
+  assert.equal(bounds.subpaths, 1, 'the contour stays a single connected outline')
+  const centerOf = (spec) => ({
+    x: spec.position.x + NODE_W / 2,
+    y: spec.position.y + NODE_H / 2,
+  })
+  const contains = (spec) => polygonContains(bounds.points, centerOf(spec).x, centerOf(spec).y)
+  assert.equal(contains(start), true, 'the source member is inside the contour')
+  assert.equal(contains(goal), true, 'the target member is inside the contour')
+  assert.equal(contains(blocker), false, 'the blocking card is not swallowed by the corridor')
+  assert.equal(contains(other), false, 'a card next to the corridor is not swallowed either')
 })
 
 test('a horizontal edge stays flat when another edge shares its target', async (t) => {

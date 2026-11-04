@@ -2495,8 +2495,9 @@ window.__ModuleLoader__.load({
     function bowCandidate(from, to, bow) {
       const length = Math.hypot(to.x - from.x, to.y - from.y) || 1
       // The bow never dominates the edge: short edges stay almost straight, and
-      // even long ones only bend by a fraction of their own length.
-      const limit = Math.min(80, Math.max(14, length * 0.22))
+      // even long ones only bend by a fraction of their own length. Blocked
+      // edges need a larger reach to clear a card, so the cap is generous.
+      const limit = Math.min(200, Math.max(14, length * 0.45))
       const shift = clamp(Number(bow) || 0, -limit, limit)
       // One cubic, not a chain: a two-segment chain is only C1 continuous, and
       // the curvature jump at the joint reads as a visible kink on screen.
@@ -2633,6 +2634,20 @@ window.__ModuleLoader__.load({
         if (candidate !== null) candidates.push(candidate)
       }
       if (!directBlocked) return candidates
+      // A single cubic with a larger sideways bow often clears the blocking
+      // card. That is much nicer than an orthogonal detour whose corner sits
+      // right next to the handle (it reads as a hook). Only offered for long
+      // blocked edges: on a short edge a big bow would loop on itself.
+      const edgeLength = Math.hypot(to.x - from.x, to.y - from.y)
+      if (edgeLength >= 220) {
+        const reach = Math.min(180, edgeLength * 0.3)
+        for (const bow of [reach, -reach, reach * 0.6, -reach * 0.6]) {
+          const candidate = bowCandidate(from, to, bow + groupOffset)
+          if (candidate === null) continue
+          if (!candidateClearsObstacles(candidate.points, obstacles)) continue
+          candidates.push(candidate)
+        }
+      }
       const guidePads = [EDGE_GUIDE_PAD, EDGE_GUIDE_PAD + 18]
       // Two smoothing strengths: the heavier pass turns the orthogonal guide
       // into a round arc instead of a right angle with rounded corners, while
@@ -2777,6 +2792,7 @@ window.__ModuleLoader__.load({
 
       const routed = []
       const paths = {}
+      const points = {}
       for (const edge of ordered) {
         const fromPosition = positions[edge.from]
         const toPosition = positions[edge.to]
@@ -2795,9 +2811,10 @@ window.__ModuleLoader__.load({
         const candidates = edgeCandidates(from, to, groupOffsets[edge.id] || 0, nearby, new Set([edge.from, edge.to]))
         const chosen = chooseEdgeCandidate(candidates, nearby, routed)
         paths[edge.id] = chosen.d
+        points[edge.id] = chosen.points
         routed.push({ points: downsamplePolyline(chosen.points, 18), box: pointsBoundingBox(chosen.points) })
       }
-      return paths
+      return { paths, points }
     }
 
     /* ------------------------------------------------------------------ */
@@ -2898,14 +2915,15 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Closed SVG path through an axis-aligned loop with circular fillets of
-     * `radius` at every corner (drawn with arc commands so the curvature is the
-     * same as the node cards' rounded rectangle).
+     * Closed SVG path through a polygon with circular fillets of `radius` at
+     * every corner (drawn with arc commands). The loop may mix axis-aligned
+     * cell edges with the slanted sides of an edge corridor, so every corner is
+     * handled with the generic incoming/outgoing direction pair.
      */
-    function roundedRectilinearPath(points, radius) {
+    function roundedLoopPath(points, radius) {
       const clean = simplifyClosedLoop(points)
       const count = clean.length
-      if (count < 4) return ''
+      if (count < 3) return ''
       const corners = []
       for (let index = 0; index < count; index += 1) {
         const previous = clean[(index - 1 + count) % count]
@@ -2932,8 +2950,9 @@ window.__ModuleLoader__.load({
       let d = 'M ' + round1(corners[0].entry.x) + ' ' + round1(corners[0].entry.y)
       for (let index = 0; index < corners.length; index += 1) {
         const corner = corners[index]
+        const degenerate = distanceBetween(corner.entry, corner.exit) < 0.5
         if (index > 0) d += ' L ' + round1(corner.entry.x) + ' ' + round1(corner.entry.y)
-        if (corner.radius >= 0.5) {
+        if (corner.radius >= 0.5 && !degenerate) {
           d += ' A ' + round1(corner.radius) + ' ' + round1(corner.radius) + ' 0 0 '
             + (corner.cross > 0 ? 1 : 0) + ' ' + round1(corner.exit.x) + ' ' + round1(corner.exit.y)
         } else {
@@ -2943,48 +2962,238 @@ window.__ModuleLoader__.load({
       return d + ' Z'
     }
 
-    // A group contour follows the grid cells its cards occupy plus the cells the
-    // connections between members pass through. Without the connection cells a
-    // group whose members sit in non-adjacent cells would be drawn as several
-    // separate contours.
-    const GROUP_EDGE_BUFFER = 18
+    // A group contour is the union of two geometric regions:
+    //   - the grid cells its cards occupy (grid-aligned, rounded), and
+    //   - a narrow buffer band that follows each internal connection.
+    // The band is deliberately NOT snapped to the grid: an edge corridor used
+    // to claim whole 320x198 cells and swallow unrelated cards sitting in them.
+    const GROUP_EDGE_HALF_WIDTH = 9
+    const GROUP_BAND_SAMPLES = 18
 
-    function cellKeyAt(x, y) {
-      return Math.floor((x - GRID_X0) / GRID_W) + ',' + Math.floor((y - GRID_Y0) / GRID_H)
+    function loopToWorld(loop) {
+      return loop.map((point) => ({
+        x: GRID_X0 + point.c * GRID_W,
+        y: GRID_Y0 + point.r * GRID_H,
+      }))
     }
 
-    /** Mark every grid cell a buffered segment passes through. */
-    function addSegmentCells(cells, start, end, buffer) {
-      const dx = end.x - start.x
-      const dy = end.y - start.y
-      const length = Math.hypot(dx, dy)
-      if (!(length > 0)) {
-        cells.add(cellKeyAt(start.x, start.y))
-        return
+    /** Signed area of a polygon loop (positive = counter-clockwise in math axes). */
+    function polygonSignedArea(points) {
+      let area = 0
+      for (let index = 0; index < points.length; index += 1) {
+        const current = points[index]
+        const next = points[(index + 1) % points.length]
+        area += current.x * next.y - next.x * current.y
       }
-      const normalX = -dy / length
-      const normalY = dx / length
-      const steps = Math.max(1, Math.min(400, Math.ceil(length / 10)))
-      const offsets = buffer > 0 ? [0, buffer, -buffer] : [0]
-      for (let step = 0; step <= steps; step += 1) {
-        const t = step / steps
-        const x = start.x + dx * t
-        const y = start.y + dy * t
-        for (const offset of offsets) {
-          cells.add(cellKeyAt(x + normalX * offset, y + normalY * offset))
-        }
+      return area / 2
+    }
+
+    /** Consistently oriented, duplicate-free copy of a loop. */
+    function normalizePolygon(points) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || distanceBetween(last, point) > 0.01) clean.push({ x: point.x, y: point.y })
       }
+      if (clean.length > 1 && distanceBetween(clean[0], clean[clean.length - 1]) <= 0.01) clean.pop()
+      if (clean.length < 3) return []
+      return polygonSignedArea(clean) < 0 ? clean.reverse() : clean
+    }
+
+    /** Standard ray casting; only the strict interior is relevant here. */
+    function pointInsidePolygon(x, y, points) {
+      let inside = false
+      for (let index = 0, previous = points.length - 1; index < points.length; previous = index, index += 1) {
+        const current = points[index]
+        const before = points[previous]
+        if ((current.y > y) === (before.y > y)) continue
+        const xAtY = ((before.x - current.x) * (y - current.y)) / (before.y - current.y) + current.x
+        if (x < xAtY) inside = !inside
+      }
+      return inside
+    }
+
+    /** Intersection point of two segments, or null when they do not cross. */
+    function segmentCrossing(a, b, c, d) {
+      const r = { x: b.x - a.x, y: b.y - a.y }
+      const s = { x: d.x - c.x, y: d.y - c.y }
+      const denominator = r.x * s.y - r.y * s.x
+      if (Math.abs(denominator) < 1e-9) return null
+      const delta = { x: c.x - a.x, y: c.y - a.y }
+      const t = (delta.x * s.y - delta.y * s.x) / denominator
+      const u = (delta.x * r.y - delta.y * r.x) / denominator
+      if (t <= 1e-6 || t >= 1 - 1e-6 || u <= 1e-6 || u >= 1 - 1e-6) return null
+      return { x: a.x + r.x * t, y: a.y + r.y * t, t, u }
+    }
+
+    function simplifyUnionLoop(points) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || distanceBetween(last, point) > 0.5) clean.push(point)
+      }
+      if (clean.length > 1 && distanceBetween(clean[0], clean[clean.length - 1]) <= 0.5) clean.pop()
+      const count = clean.length
+      if (count < 3) return clean
+      const out = []
+      for (let index = 0; index < count; index += 1) {
+        const before = clean[(index - 1 + count) % count]
+        const current = clean[index]
+        const after = clean[(index + 1) % count]
+        const spanX = after.x - before.x
+        const spanY = after.y - before.y
+        const span = Math.hypot(spanX, spanY) || 1
+        const distance = Math.abs((current.x - before.x) * spanY - (current.y - before.y) * spanX) / span
+        if (distance <= 0.25) continue
+        out.push(current)
+      }
+      return out.length >= 3 ? out : clean
     }
 
     /**
-     * Cells that connect the members with each other: every edge whose two
-     * endpoints are both in the group, then one simulated link per remaining
-     * component (closest pair of members), so an isolated member or a cluster
-     * without internal edges still shares a single contour with the rest.
+     * Boundary of the union of simple polygons (an arrangement walk).
+     *
+     * Every boundary edge is split at its crossings with the other polygons;
+     * pieces whose midpoint falls inside another polygon are dropped, and the
+     * rest is stitched back into closed loops. Handles the case that matters
+     * here: rounded card-cell blocks grown by slanted connection bands.
      */
-    function groupConnectionCells(memberIds, positions, edges) {
-      const cells = new Set()
-      if (memberIds.length < 2) return cells
+    function unionPolygons(polygons) {
+      const shapes = polygons.map(normalizePolygon).filter((points) => points.length >= 3)
+      if (shapes.length === 0) return []
+      if (shapes.length === 1) return shapes
+      const segments = []
+      for (let shapeIndex = 0; shapeIndex < shapes.length; shapeIndex += 1) {
+        const points = shapes[shapeIndex]
+        for (let index = 0; index < points.length; index += 1) {
+          segments.push({
+            shape: shapeIndex,
+            a: points[index],
+            b: points[(index + 1) % points.length],
+            cuts: [],
+          })
+        }
+      }
+      for (let left = 0; left < segments.length; left += 1) {
+        for (let right = left + 1; right < segments.length; right += 1) {
+          if (segments[left].shape === segments[right].shape) continue
+          const crossing = segmentCrossing(segments[left].a, segments[left].b, segments[right].a, segments[right].b)
+          if (crossing === null) continue
+          segments[left].cuts.push({ t: crossing.t, point: { x: crossing.x, y: crossing.y } })
+          segments[right].cuts.push({ t: crossing.u, point: { x: crossing.x, y: crossing.y } })
+        }
+      }
+      const kept = []
+      for (const segment of segments) {
+        segment.cuts.sort((a, b) => a.t - b.t)
+        const nodes = [{ t: 0, point: segment.a }, ...segment.cuts, { t: 1, point: segment.b }]
+        for (let index = 0; index < nodes.length - 1; index += 1) {
+          const from = nodes[index]
+          const to = nodes[index + 1]
+          if (to.t - from.t < 1e-6) continue
+          const middle = { x: (from.point.x + to.point.x) / 2, y: (from.point.y + to.point.y) / 2 }
+          let covered = false
+          for (let shapeIndex = 0; shapeIndex < shapes.length; shapeIndex += 1) {
+            if (shapeIndex === segment.shape) continue
+            if (pointInsidePolygon(middle.x, middle.y, shapes[shapeIndex])) {
+              covered = true
+              break
+            }
+          }
+          if (covered) continue
+          kept.push({ a: from.point, b: to.point })
+        }
+      }
+      const keyOf = (point) => round2(point.x) + ',' + round2(point.y)
+      const atPoint = new Map()
+      kept.forEach((segment, index) => {
+        for (const point of [segment.a, segment.b]) {
+          const key = keyOf(point)
+          if (!atPoint.has(key)) atPoint.set(key, [])
+          atPoint.get(key).push(index)
+        }
+      })
+      const used = new Set()
+      const loops = []
+      for (let startIndex = 0; startIndex < kept.length; startIndex += 1) {
+        if (used.has(startIndex)) continue
+        used.add(startIndex)
+        const first = kept[startIndex]
+        const loop = [{ x: first.a.x, y: first.a.y }]
+        let point = first.b
+        let direction = { x: first.b.x - first.a.x, y: first.b.y - first.a.y }
+        let closed = false
+        for (let guard = 0; guard <= kept.length + 1; guard += 1) {
+          loop.push({ x: point.x, y: point.y })
+          if (keyOf(point) === keyOf(loop[0])) {
+            closed = true
+            break
+          }
+          const candidates = (atPoint.get(keyOf(point)) || []).filter((index) => !used.has(index))
+          if (candidates.length === 0) break
+          let chosen = -1
+          let bestScore = -Infinity
+          for (const candidateIndex of candidates) {
+            const candidate = kept[candidateIndex]
+            const other = keyOf(candidate.a) === keyOf(point) ? candidate.b : candidate.a
+            const nextDirection = { x: other.x - point.x, y: other.y - point.y }
+            const firstLength = Math.hypot(direction.x, direction.y) || 1
+            const secondLength = Math.hypot(nextDirection.x, nextDirection.y) || 1
+            const score = (direction.x * nextDirection.x + direction.y * nextDirection.y)
+              / (firstLength * secondLength)
+            if (score > bestScore) {
+              bestScore = score
+              chosen = candidateIndex
+            }
+          }
+          if (chosen < 0) break
+          used.add(chosen)
+          const next = kept[chosen]
+          const nextPoint = keyOf(next.a) === keyOf(point) ? next.b : next.a
+          direction = { x: nextPoint.x - point.x, y: nextPoint.y - point.y }
+          point = nextPoint
+        }
+        if (!closed || loop.length < 4) continue
+        const simplified = simplifyUnionLoop(loop)
+        if (simplified.length >= 3) loops.push(simplified)
+      }
+      return loops
+    }
+
+    /** A polygon following a polyline with `halfWidth` on both sides. */
+    function bandPolygon(points, halfWidth) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || distanceBetween(last, point) > 1) clean.push({ x: point.x, y: point.y })
+      }
+      if (clean.length < 2) return []
+      const left = []
+      const right = []
+      for (let index = 0; index < clean.length; index += 1) {
+        const before = clean[Math.max(0, index - 1)]
+        const after = clean[Math.min(clean.length - 1, index + 1)]
+        const tangentX = after.x - before.x
+        const tangentY = after.y - before.y
+        const length = Math.hypot(tangentX, tangentY) || 1
+        const normalX = -tangentY / length
+        const normalY = tangentX / length
+        left.push({ x: clean[index].x + normalX * halfWidth, y: clean[index].y + normalY * halfWidth })
+        right.push({ x: clean[index].x - normalX * halfWidth, y: clean[index].y - normalY * halfWidth })
+      }
+      return [...left, ...right.reverse()]
+    }
+
+    /**
+     * Connection polylines inside a group. Edges with both endpoints in the
+     * group follow the edge's actual routed curve, so a corridor follows the
+     * line as drawn instead of cutting through unrelated cards. Remaining
+     * disconnected components (including a member without any internal edge)
+     * are joined by a straight simulated link to the closest other member.
+     */
+    function groupConnectionBands(memberIds, positions, edges, edgePoints) {
+      const bands = []
+      if (memberIds.length < 2) return bands
       const index = new Map(memberIds.map((nodeId, offset) => [nodeId, offset]))
       const centers = memberIds.map((nodeId) => ({
         x: positions[nodeId].x + NODE_W / 2,
@@ -3012,7 +3221,15 @@ window.__ModuleLoader__.load({
         if (!index.has(edge.from) || !index.has(edge.to)) continue
         const fromIndex = index.get(edge.from)
         const toIndex = index.get(edge.to)
-        addSegmentCells(cells, centers[fromIndex], centers[toIndex], GROUP_EDGE_BUFFER)
+        const routed = edgePoints !== null && edgePoints !== undefined ? edgePoints[edge.id] : null
+        let line
+        if (Array.isArray(routed) && routed.length > 1) {
+          const sampled = decimatePolyline(thinPolyline(routed, 6), GROUP_BAND_SAMPLES)
+          line = [centers[fromIndex], ...sampled, centers[toIndex]]
+        } else {
+          line = [centers[fromIndex], centers[toIndex]]
+        }
+        bands.push(line)
         unite(fromIndex, toIndex)
       }
       for (let guard = 0; guard < memberIds.length; guard += 1) {
@@ -3021,20 +3238,18 @@ window.__ModuleLoader__.load({
           for (let right = left + 1; right < memberIds.length; right += 1) {
             if (find(left) === find(right)) continue
             const distance = distanceBetween(centers[left], centers[right])
-            if (best === null || distance < best.distance - 1e-9) {
-              best = { left, right, distance }
-            }
+            if (best === null || distance < best.distance - 1e-9) best = { left, right, distance }
           }
         }
         if (best === null) break
-        addSegmentCells(cells, centers[best.left], centers[best.right], GROUP_EDGE_BUFFER)
+        bands.push([centers[best.left], centers[best.right]])
         unite(best.left, best.right)
       }
-      return cells
+      return bands
     }
 
     /** One dashed contour per group, plus the bounds used for its label. */
-    function groupOutlineShapes(groups, positions, edges) {
+    function groupOutlineShapes(groups, positions, edges, edgePoints) {
       const shapes = []
       for (const group of groups) {
         const cells = new Set()
@@ -3055,18 +3270,17 @@ window.__ModuleLoader__.load({
           }
         }
         if (memberIds.length === 0 || cells.size === 0) continue
-        // Add the corridor cells that connect the members, so a group is drawn
-        // as one contour even when its cards are not in adjacent cells.
-        for (const key of groupConnectionCells(memberIds, positions, edges)) cells.add(key)
+        const polygons = groupOutlineLoops(cells).map(loopToWorld)
+        for (const band of groupConnectionBands(memberIds, positions, edges, edgePoints)) {
+          const polygon = bandPolygon(band, GROUP_EDGE_HALF_WIDTH)
+          if (polygon.length >= 3) polygons.push(polygon)
+        }
+        const loops = unionPolygons(polygons)
         let d = ''
         let labelBounds = null
-        for (const loop of groupOutlineLoops(cells)) {
-          const world = loop.map((point) => ({
-            x: GRID_X0 + point.c * GRID_W,
-            y: GRID_Y0 + point.r * GRID_H,
-          }))
-          d += roundedRectilinearPath(world, GROUP_CORNER_RADIUS)
-          const bounds = pointsBoundingBox(world)
+        for (const loop of loops) {
+          d += roundedLoopPath(loop, GROUP_CORNER_RADIUS)
+          const bounds = pointsBoundingBox(loop)
           const area = (bounds.right - bounds.left) * (bounds.bottom - bounds.top)
           if (labelBounds === null || area > labelBounds.area) {
             labelBounds = Object.assign({ area }, bounds)
@@ -4207,7 +4421,6 @@ window.__ModuleLoader__.load({
       }
       positionsRef.current = positions
 
-      const groupShapes = groupOutlineShapes(model.groups, positions, model.edges)
       const lassoHits = lasso !== null ? nodesFullyInside(lasso) : []
       const lassoPath = lasso !== null ? closedPolylinePath(lasso) : ''
       const pendingGroupTargets = new Set(
@@ -4234,7 +4447,9 @@ window.__ModuleLoader__.load({
       // Every edge is routed together so each curve can steer clear of the
       // previously routed ones; the result is a pure cubic chain, never an
       // orthogonal segment.
-      const edgePaths = routeEdgeSet(model.edges, positions, softObstacleRects, hardObstacleRects)
+      const edgeRoutes = routeEdgeSet(model.edges, positions, softObstacleRects, hardObstacleRects)
+      const edgePaths = edgeRoutes.paths
+      const groupShapes = groupOutlineShapes(model.groups, positions, model.edges, edgeRoutes.points)
       const edgeElements = []
       for (const edge of model.edges) {
         const fromPos = positions[edge.from]

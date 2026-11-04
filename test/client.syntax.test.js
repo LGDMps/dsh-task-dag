@@ -225,9 +225,12 @@ test('milestone is a marker, drafts are flushed, edges avoid unrelated nodes', (
   assert.equal(source.includes('function smoothCubicChain('), false,
     'the C1-only interpolating chain (visible curvature kinks) must not come back')
   assert.match(source, /const EDGE_CLEARANCE =/)
-  // Group contours include the connection corridors, so a group is one contour.
-  assert.match(source, /function groupConnectionCells\(/)
-  assert.match(source, /const GROUP_EDGE_BUFFER =/)
+  // Group contours are the polygon union of card cells and non-grid-aligned
+  // connection bands, so a corridor cannot swallow a whole grid cell.
+  assert.match(source, /function groupConnectionBands\(/)
+  assert.match(source, /function unionPolygons\(/)
+  assert.match(source, /function bandPolygon\(/)
+  assert.match(source, /const GROUP_EDGE_HALF_WIDTH =/)
   assert.match(source, /const EDGE_SEPARATION =/)
 })
 
