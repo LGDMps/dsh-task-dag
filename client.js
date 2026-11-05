@@ -2384,6 +2384,38 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    /** Re-sample a polyline at roughly `step` spacing (arc length). */
+    function resamplePolyline(points, step) {
+      const clean = []
+      for (const point of points) {
+        const last = clean[clean.length - 1]
+        if (last === undefined || distanceBetween(last, point) > 0.01) clean.push({ x: point.x, y: point.y })
+      }
+      if (clean.length < 2 || !(step > 0)) return clean
+      const cumulative = [0]
+      for (let index = 1; index < clean.length; index += 1) {
+        cumulative.push(cumulative[index - 1] + distanceBetween(clean[index - 1], clean[index]))
+      }
+      const total = cumulative[cumulative.length - 1]
+      if (!(total > 0)) return clean
+      const out = [clean[0]]
+      let segment = 1
+      for (let target = step; target < total - 0.01; target += step) {
+        while (segment < clean.length - 1 && cumulative[segment] < target) segment += 1
+        const from = clean[segment - 1]
+        const to = clean[segment]
+        const span = cumulative[segment] - cumulative[segment - 1] || 1
+        const ratio = (target - cumulative[segment - 1]) / span
+        out.push({
+          x: from.x + (to.x - from.x) * ratio,
+          y: from.y + (to.y - from.y) * ratio,
+        })
+      }
+      const last = clean[clean.length - 1]
+      if (distanceBetween(out[out.length - 1], last) > 0.01) out.push(last)
+      return out
+    }
+
     /**
      * Clamped cubic spline through `points` (chord-length parameterisation).
      *
@@ -2931,7 +2963,6 @@ window.__ModuleLoader__.load({
         const next = clean[(index + 1) % count]
         const incomingLength = distanceBetween(previous, current) || 1
         const outgoingLength = distanceBetween(current, next) || 1
-        const cornerRadius = Math.min(radius, incomingLength / 2, outgoingLength / 2)
         const incoming = {
           x: (current.x - previous.x) / incomingLength,
           y: (current.y - previous.y) / incomingLength,
@@ -2940,9 +2971,26 @@ window.__ModuleLoader__.load({
           x: (next.x - current.x) / outgoingLength,
           y: (next.y - current.y) / outgoingLength,
         }
+        // Tangency offset for a fillet of `radius`: t = r * tan(turn / 2).
+        // Using t = r (as a 90-degree-only shortcut) would make shallow corners
+        // draw a near-semicircle and turn every sampled band vertex into a bump.
+        const dot = clamp(incoming.x * outgoing.x + incoming.y * outgoing.y, -1, 1)
+        const turn = Math.acos(dot)
+        const halfTangent = Math.tan(turn / 2)
+        let tangent = 0
+        let cornerRadius = 0
+        if (halfTangent > 1e-6) {
+          cornerRadius = radius
+          tangent = cornerRadius * halfTangent
+          const limit = Math.min(incomingLength / 2, outgoingLength / 2)
+          if (tangent > limit) {
+            tangent = limit
+            cornerRadius = tangent / halfTangent
+          }
+        }
         corners.push({
-          entry: { x: current.x - incoming.x * cornerRadius, y: current.y - incoming.y * cornerRadius },
-          exit: { x: current.x + outgoing.x * cornerRadius, y: current.y + outgoing.y * cornerRadius },
+          entry: { x: current.x - incoming.x * tangent, y: current.y - incoming.y * tangent },
+          exit: { x: current.x + outgoing.x * tangent, y: current.y + outgoing.y * tangent },
           radius: cornerRadius,
           cross: incoming.x * outgoing.y - incoming.y * outgoing.x,
         })
@@ -2967,7 +3015,7 @@ window.__ModuleLoader__.load({
     //   - a narrow buffer band that follows each internal connection.
     // The band is deliberately NOT snapped to the grid: an edge corridor used
     // to claim whole 320x198 cells and swallow unrelated cards sitting in them.
-    const GROUP_EDGE_HALF_WIDTH = 9
+    const GROUP_EDGE_HALF_WIDTH = 10
     const GROUP_BAND_SAMPLES = 18
 
     function loopToWorld(loop) {
@@ -3224,7 +3272,12 @@ window.__ModuleLoader__.load({
         const routed = edgePoints !== null && edgePoints !== undefined ? edgePoints[edge.id] : null
         let line
         if (Array.isArray(routed) && routed.length > 1) {
-          const sampled = decimatePolyline(thinPolyline(routed, 6), GROUP_BAND_SAMPLES)
+          // Even re-sampling plus a smoothing pass keeps the offset normals
+          // stable; sampling the raw candidate points made the corridor edge
+          // visibly jitter.
+          const evenly = resamplePolyline(routed, 10)
+          const smoothed = chaikinSmooth(evenly, 1)
+          const sampled = decimatePolyline(smoothed, GROUP_BAND_SAMPLES)
           line = [centers[fromIndex], ...sampled, centers[toIndex]]
         } else {
           line = [centers[fromIndex], centers[toIndex]]
