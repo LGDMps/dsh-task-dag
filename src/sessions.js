@@ -12,6 +12,10 @@
  *   except `session/list`, which takes {_request: {}}.
  *   stream({namespace:'session', method:'follow', args:{request:{...}}}).
  *
+ * Current DSH runtimes exclude `contextPressure` from the `session/list`
+ * summary (`SessionProjectionSummaryExcluded`), so the water level is read from
+ * `session/projections` (`{request:{sessionId}}`) when the summary lacks it.
+ *
  * Every helper turns failures into `TaskDagError`; raw errors never escape.
  */
 
@@ -260,6 +264,117 @@ function contextPressureOf(summary) {
   return out
 }
 
+/* ------------------------------------------------------------------ */
+/* context pressure from session/projections                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * How long one session's `contextPressure` may be reused.
+ *
+ * Reading a projection can touch the session log, and the panel polls more
+ * often than the pressure meaningfully changes, so a few seconds of caching
+ * removes almost all duplicate reads without making the water level feel stale.
+ */
+export const PROJECTIONS_CACHE_MS = 4_000
+
+/** How many `session/projections` calls one snapshot may run in parallel. */
+export const PROJECTIONS_CONCURRENCY = 6
+
+/** Per-context cache: `sessionId -> {at, value}` for `PROJECTIONS_CACHE_MS`. */
+const PROJECTIONS_CACHE = new WeakMap()
+
+/** Forget cached pressure for one context (tests / reconnect flows). */
+export function invalidateProjectionsCache(ctx) {
+  if (ctx !== null && typeof ctx === 'object') PROJECTIONS_CACHE.delete(ctx)
+}
+
+/** A broken host warns once instead of once per session (and per poll). */
+let projectionsWarned = false
+
+function warnProjectionsOnce(error) {
+  if (projectionsWarned) return
+  projectionsWarned = true
+  console.warn(`[dsh-task-dag] 读取会话上下文水位失败，本次快照暂时留空：${reasonOf(error)}`)
+}
+
+/**
+ * Normalize a `session/projections` response into the wire view.
+ *
+ * Accepted shapes are the current `{kind:'sequenced', asOfSeq, values}` and
+ * `{kind:'migration-required', values}`, a bare `{values}` wrapper, a values
+ * map without wrapper, and `null`. Unknown shapes and fields collapse to `{}`,
+ * so a newer host cannot break the snapshot.
+ */
+function contextPressureFromProjections(response) {
+  if (response === null || typeof response !== 'object') return {}
+  return contextPressureOf({ projections: response })
+}
+
+/** Drop entries that already outlived the TTL; keeps the per-context map bounded. */
+function pruneProjectionsCache(cache, nowMs) {
+  for (const [sessionId, entry] of cache) {
+    if (nowMs - entry.at >= PROJECTIONS_CACHE_MS) cache.delete(sessionId)
+  }
+}
+
+/**
+ * Read one session's context pressure, cached for `PROJECTIONS_CACHE_MS`.
+ * Any failure is a warning plus `{}`; it never fails the surrounding snapshot.
+ */
+async function readContextPressure(ctx, sessionId, nowMs) {
+  const cacheable = ctx !== null && typeof ctx === 'object'
+  let cache
+  if (cacheable) {
+    cache = PROJECTIONS_CACHE.get(ctx)
+    const cached = cache?.get(sessionId)
+    if (cached !== undefined) {
+      if (nowMs - cached.at < PROJECTIONS_CACHE_MS) return cached.value
+      cache.delete(sessionId)
+    }
+  }
+
+  let value = {}
+  try {
+    const response = await invoke(ctx, 'session', 'projections', { request: { sessionId } })
+    value = contextPressureFromProjections(response)
+  } catch (error) {
+    warnProjectionsOnce(error)
+  }
+
+  if (cacheable) {
+    if (cache === undefined) {
+      cache = new Map()
+      PROJECTIONS_CACHE.set(ctx, cache)
+    }
+    if (cache.size >= 256) pruneProjectionsCache(cache, nowMs)
+    cache.set(sessionId, { at: nowMs, value })
+  }
+  return value
+}
+
+/**
+ * Read several sessions' pressure with a bounded pool of gateway calls.
+ *
+ * @returns {Promise<Map<string, object>>} `sessionId -> contextPressure`
+ */
+async function readContextPressures(ctx, sessionIds, nowMs) {
+  const values = new Map()
+  let next = 0
+  const worker = async () => {
+    while (next < sessionIds.length) {
+      const sessionId = sessionIds[next]
+      next += 1
+      values.set(sessionId, await readContextPressure(ctx, sessionId, nowMs))
+    }
+  }
+  const workers = Array.from(
+    { length: Math.min(PROJECTIONS_CONCURRENCY, sessionIds.length) },
+    worker,
+  )
+  await Promise.all(workers)
+  return values
+}
+
 /** The host-wide archived set, read without assuming the getter exists. */
 function archivedIdsOf(ctx) {
   const registry = getService(ctx, 'workspaceRegistry')
@@ -282,9 +397,17 @@ function archivedIdsOf(ctx) {
 /**
  * Batch-enrich session ids with host facts.
  *
+ * `session/list` supplies identity and state; the context water level is
+ * completed from `session/projections` only when the summary cannot provide a
+ * usable `ratio` (current DSH runtimes exclude `contextPressure` from the
+ * summary). The extra read is cached, bounded, and non-fatal.
+ *
+ * @param {object} ctx plugin context
+ * @param {Iterable<string>|Array<string>} sessionIds
+ * @param {number} [nowMs] clock injection point for the projections cache
  * @returns {Promise<{byId: Record<string, object>, archived: string[], warnings: string[]}>}
  */
-export async function sessionFacts(ctx, sessionIds) {
+export async function sessionFacts(ctx, sessionIds, nowMs = Date.now()) {
   const source = Array.isArray(sessionIds)
     ? sessionIds
     : sessionIds !== null && typeof sessionIds === 'object' && typeof sessionIds[Symbol.iterator] === 'function'
@@ -339,6 +462,20 @@ export async function sessionFacts(ctx, sessionIds) {
       continue
     }
     byId[id] = factFromSummary(id, summary)
+  }
+
+  // Complete the water level for listed sessions whose summary no longer
+  // carries it. A host from before the projection split keeps the value in the
+  // summary, so no extra RPC happens there.
+  const needsPressure = ids.filter((id) => {
+    const fact = byId[id]
+    return fact.available === true && fact.contextPressure.ratio === undefined
+  })
+  if (needsPressure.length > 0) {
+    const pressures = await readContextPressures(ctx, needsPressure, nowMs)
+    for (const [id, pressure] of pressures) {
+      if (Object.keys(pressure).length > 0) byId[id].contextPressure = pressure
+    }
   }
 
   return { byId, archived, warnings }

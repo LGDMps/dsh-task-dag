@@ -234,6 +234,36 @@ test('milestone is a marker, drafts are flushed, edges avoid unrelated nodes', (
   assert.match(source, /const EDGE_SEPARATION =/)
 })
 
+test('multi-selection, Ctrl-copy and one-step delete stay wired to the contract', () => {
+  // Lasso and two-click rectangle both end in `onSelectMany`; the old direct
+  // "lasso opens the group dialog" path must not come back.
+  assert.match(source, /function beginAltSelection\(event\)/)
+  assert.match(source, /function nodesInsideRect\(rect\)/)
+  assert.match(source, /const \[rectSelection, setRectSelection\] = useState\(null\)/)
+  assert.match(source, /const \[duplicateGhost, setDuplicateGhost\] = useState\(null\)/)
+  assert.match(source, /onSelectMany: handleSelectMany/)
+  assert.equal(source.includes('onLasso:'), false, 'selection goes through onSelectMany')
+  assert.equal(source.includes('handleLasso'), false, 'the lasso-specific group opener is gone')
+
+  // The selection panel offers 组合 / 删除; delete always asks once more.
+  assert.match(source, /function SelectionPanel\(props\)/)
+  assert.match(source, /function DeleteNodesDialog\(props\)/)
+  assert.ok(source.includes('已选中 '), 'the panel reports the selection count')
+  assert.ok(source.includes('确认删除节点？'), 'delete has its own confirmation')
+  assert.ok(source.includes('至少选中两个节点才能组合'), '组合 is disabled below two nodes')
+  assert.ok(source.includes("'delete-node'"), 'deletion posts delete-node')
+  assert.ok(source.includes('archiveSessions: true'), 'quick delete archives the session chain')
+  assert.ok(source.includes('mode: \'splice\''), 'quick delete keeps successor constraints')
+
+  // Ctrl+drag copies the node (or the whole multi-selection) without edges.
+  assert.match(source, /const handleDuplicateNodes = useCallback\(/)
+  assert.ok(source.includes('已复制节点'), 'the copy is reported')
+  assert.ok(source.includes('onDuplicateNodes: handleDuplicateNodes'))
+  assert.ok(source.includes('dsh-td-duplicate-ghost'), 'a ghost previews the copies')
+  assert.ok(source.includes('Ctrl+拖动复制节点'), 'the canvas hint documents the gesture')
+  assert.ok(source.includes('Del 删除选中'), 'the canvas hint documents Del')
+})
+
 test('keeps the UI polish invariants: DSH font scale, resizable columns, markdown notes, docked notice', () => {
   // One typographic scale derived from the DSH global font-size preference.
   assert.ok(

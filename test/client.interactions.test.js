@@ -1,14 +1,17 @@
 /**
  * Interaction tests for the third UI round of the browser half.
  *
- * Covers the four behaviours that are not visible from a static render:
+ * Covers the behaviours that are not visible from a static render:
  *   1. long node titles are fitted to the card and clipped at its border;
  *   2. a manual node drag can be undone back to the pre-drag positions;
  *   3. an auto layout can be undone back to the pre-layout positions;
- *   4. Alt + left drag draws a lasso, selects only fully enclosed nodes, opens
- *      the group-name dialog, posts `create-group`, and renders one dashed
- *      contour whose corners use the card radius and whose corridor follows the
- *      routed edges.
+ *   4. Alt + drag draws a lasso and Alt click + move + click draws a rectangle;
+ *      both fully enclose nodes, open the 组合 / 删除 panel, and the group flow
+ *      still posts create-group and renders one dashed contour;
+ *   5. Del on one selected node and the panel's 删除 action both ask once more
+ *      before posting delete-node;
+ *   6. Ctrl + drag copies one node, or the whole multi-selection, without
+ *      copying the original edges.
  *
  * The panel is mounted against a mutable in-memory graph, so action responses
  * behave like the Host's snapshots (positions/groups applied, revision bumped).
@@ -135,6 +138,8 @@ function snapshotOf(graph) {
   }
 }
 
+let createdNodeSeq = 0
+
 function applyAction(graph, action, payload) {
   if (action === 'set-positions') {
     for (const entry of Array.isArray(payload.positions) ? payload.positions : []) {
@@ -144,6 +149,26 @@ function applyAction(graph, action, payload) {
         ? null
         : { x: entry.position.x, y: entry.position.y }
     }
+  } else if (action === 'add-node') {
+    createdNodeSeq += 1
+    const created = node(
+      'n_new' + String(createdNodeSeq),
+      payload.title,
+      payload.position?.x ?? 0,
+      payload.position?.y ?? 0,
+    )
+    created.notes = typeof payload.notes === 'string' ? payload.notes : ''
+    for (const key of ['agentPreset', 'model', 'reasoningEffort']) {
+      if (typeof payload[key] === 'string' && payload[key] !== '') created[key] = payload[key]
+    }
+    graph.nodes.push(created)
+  } else if (action === 'delete-node') {
+    graph.nodes = graph.nodes.filter((item) => item.id !== payload.nodeId)
+    graph.edges = graph.edges.filter((edge) => edge.from !== payload.nodeId && edge.to !== payload.nodeId)
+    graph.groups = graph.groups
+      .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((id) => id !== payload.nodeId) }))
+      .filter((group) => group.nodeIds.length > 0)
+    if (graph.milestoneNodeId === payload.nodeId) graph.milestoneNodeId = null
   } else if (action === 'create-group') {
     graph.groups.push({
       id: 'g_' + String(graph.groups.length + 1).padStart(8, '0'),
@@ -195,6 +220,83 @@ function pointer(window, type, options) {
     button: 0,
     buttons: type === 'pointerup' ? 0 : 1,
   }, options))
+}
+
+/** Drive the freehand lasso: pointer-down on the canvas, moves, pointer-up. */
+async function lassoSelect(harness, path) {
+  await harness.act(async () => {
+    const background = harness.container.querySelector('rect.dsh-td-canvas-bg')
+    assert.ok(background, 'the canvas background must render')
+    background.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: path[0].x,
+      clientY: path[0].y,
+      altKey: true,
+    }))
+    for (const point of path.slice(1)) {
+      harness.window.dispatchEvent(pointer(harness.window, 'pointermove', {
+        clientX: point.x,
+        clientY: point.y,
+        altKey: true,
+      }))
+    }
+    const last = path[path.length - 1]
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', {
+      clientX: last.x,
+      clientY: last.y,
+      altKey: true,
+    }))
+  })
+  await harness.settle()
+}
+
+/**
+ * Drive the two-click rectangle: an Alt click (no movement) starts the mode,
+ * moving the pointer grows the rectangle, and a second click confirms it.
+ */
+async function rectSelect(harness, start, end) {
+  await harness.act(async () => {
+    const background = harness.container.querySelector('rect.dsh-td-canvas-bg')
+    assert.ok(background, 'the canvas background must render')
+    background.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: start.x,
+      clientY: start.y,
+      altKey: true,
+    }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', {
+      clientX: start.x,
+      clientY: start.y,
+      altKey: true,
+    }))
+  })
+  await harness.settle()
+  await harness.act(async () => {
+    harness.window.dispatchEvent(pointer(harness.window, 'pointermove', {
+      clientX: end.x,
+      clientY: end.y,
+    }))
+  })
+  await harness.settle()
+  await harness.act(async () => {
+    const background = harness.container.querySelector('rect.dsh-td-canvas-bg')
+    background.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: end.x,
+      clientY: end.y,
+    }))
+  })
+  await harness.settle()
+}
+
+/** The selection actions panel, not the group-name or delete dialog. */
+function selectionPanel(harness) {
+  return [...harness.container.querySelectorAll('.dsh-td-link-card')]
+    .find((card) => (card.textContent ?? '').includes('已选中')) ?? null
+}
+
+function dialogButton(card, label) {
+  const button = [...(card?.querySelectorAll('button') ?? [])]
+    .find((item) => (item.textContent ?? '').trim() === label)
+  assert.ok(button, 'dialog button must exist: ' + label)
+  return button
 }
 
 /** Sample an SVG path made of M/L/Q/C commands into points on the curve. */
@@ -563,21 +665,29 @@ test('Alt lasso creates a group with a dashed rounded contour', async (t) => {
   })
   await harness.settle()
 
-  const dialog = harness.container.querySelector('.dsh-td-link-card')
-  assert.ok(dialog, 'the lasso opens the group-name dialog')
-  assert.match(dialog.textContent ?? '', /完全包含 2 个节点/, 'only fully enclosed nodes are counted')
-  // The enclosed cards stay highlighted until the dialog is confirmed or
-  // cancelled, so the user can check the selection before naming it.
+  const panel = [...harness.container.querySelectorAll('.dsh-td-link-card')]
+    .find((card) => (card.textContent ?? '').includes('已选中 2 个节点'))
+  assert.ok(panel, 'the lasso opens the selection actions panel')
+  // The enclosed cards stay highlighted while the panel is open, so the user
+  // can check the selection before naming it.
   assert.equal(
     harness.container.querySelectorAll('g.dsh-td-node-group-target').length,
     2,
-    'the enclosed nodes are highlighted before the group is confirmed',
+    'the enclosed nodes are highlighted before the panel action',
   )
-  assert.equal(
-    harness.container.querySelectorAll('rect.dsh-td-node-group-halo').length,
-    2,
-    'each candidate node draws its halo',
-  )
+  await harness.act(async () => {
+    const groupButton = [...panel.querySelectorAll('button')]
+      .find((button) => (button.textContent ?? '') === '组合')
+    assert.ok(groupButton, 'the panel offers 组合')
+    assert.equal(groupButton.disabled, false)
+    groupButton.click()
+  })
+  await harness.settle()
+
+  const dialog = [...harness.container.querySelectorAll('.dsh-td-link-card')]
+    .find((card) => card.querySelector('input.dsh-td-input') !== null)
+  assert.ok(dialog, '组合 opens the group-name dialog')
+  assert.match(dialog.textContent ?? '', /完全包含 2 个节点/, 'only fully enclosed nodes are counted')
   const input = dialog.querySelector('input.dsh-td-input')
   assert.ok(input, 'the dialog has a name input')
   assert.equal(input.value, '组合 1')
@@ -678,7 +788,197 @@ test('a lasso with no fully enclosed nodes does not open the dialog', async (t) 
   assert.equal(harness.container.querySelectorAll('path.dsh-td-group-outline').length, 0)
 })
 
-/** Bounds of a rounded-rectilinear contour path (M/L and arc endpoints). */
+test('Alt click, move, click again selects fully enclosed nodes with a rectangle', async (t) => {
+  const harness = await mountPanel(t)
+  await harness.act(async () => {
+    const background = harness.container.querySelector('rect.dsh-td-canvas-bg')
+    background.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: 20, clientY: 20, altKey: true,
+    }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', {
+      clientX: 20, clientY: 20, altKey: true,
+    }))
+  })
+  await harness.settle()
+  assert.equal(selectionPanel(harness), null, 'the first Alt click only starts the rectangle')
+
+  await harness.act(async () => {
+    harness.window.dispatchEvent(pointer(harness.window, 'pointermove', {
+      clientX: 660, clientY: 150,
+    }))
+  })
+  await harness.settle()
+  const marquee = harness.container.querySelector('rect.dsh-td-marquee')
+  assert.ok(marquee, 'the rectangle preview follows the pointer')
+  const countText = harness.container.querySelector('text.dsh-td-marquee-count')?.textContent ?? ''
+  assert.match(countText, /完全包含 2 个节点/, 'the preview counts fully enclosed cards')
+
+  await harness.act(async () => {
+    const background = harness.container.querySelector('rect.dsh-td-canvas-bg')
+    background.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: 660, clientY: 150,
+    }))
+  })
+  await harness.settle()
+  const panel = selectionPanel(harness)
+  assert.ok(panel, 'the second click opens the selection actions panel')
+  assert.match(panel.textContent ?? '', /已选中 2 个节点/)
+  assert.equal(harness.container.querySelectorAll('g.dsh-td-node-group-target').length, 2)
+  assert.equal(harness.container.querySelector('rect.dsh-td-marquee'), null, 'the rectangle disappears after confirming')
+})
+
+test('the selection panel deletes all selected nodes after one confirmation', async (t) => {
+  const harness = await mountPanel(t)
+  await lassoSelect(harness, [
+    { x: 20, y: 20 },
+    { x: 660, y: 20 },
+    { x: 660, y: 150 },
+    { x: 20, y: 150 },
+    { x: 20, y: 20 },
+  ])
+  const panel = selectionPanel(harness)
+  assert.ok(panel)
+  await harness.act(async () => {
+    dialogButton(panel, '删除').click()
+  })
+  await harness.settle()
+  const dialog = [...harness.container.querySelectorAll('.dsh-td-link-card')]
+    .find((card) => (card.textContent ?? '').includes('确认删除节点？'))
+  assert.ok(dialog, '删除 asks for a second confirmation')
+  assert.match(dialog.textContent ?? '', /起点任务/)
+  assert.match(dialog.textContent ?? '', /终点任务/)
+
+  await harness.act(async () => {
+    dialogButton(dialog, '确认删除 2 个节点').click()
+  })
+  await harness.settle(80)
+
+  const deletes = harness.actionRequests().filter((request) => request.action === 'delete-node')
+  assert.equal(deletes.length, 2, 'both selected nodes are deleted')
+  assert.deepEqual(deletes.map((request) => request.payload.nodeId).sort(), ['n_a', 'n_b'])
+  assert.equal(deletes[0].payload.archiveSessions, true, 'the session chain is archived')
+  assert.equal(harness.graph.nodes.some((node) => node.id === 'n_a'), false)
+  assert.equal(harness.graph.nodes.some((node) => node.id === 'n_b'), false)
+  assert.equal(harness.container.querySelectorAll('g.dsh-td-node-group-target').length, 0)
+})
+
+test('Del on a single selected node asks once, then deletes it', async (t) => {
+  const harness = await mountPanel(t)
+  await harness.act(async () => {
+    const card = harness.nodeCard('起点任务')
+    card.dispatchEvent(pointer(harness.window, 'pointerdown', { clientX: 0, clientY: 0 }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', { clientX: 0, clientY: 0 }))
+  })
+  await harness.settle()
+  await harness.act(async () => {
+    harness.window.dispatchEvent(new harness.window.KeyboardEvent('keydown', {
+      key: 'Delete',
+      bubbles: true,
+    }))
+  })
+  await harness.settle()
+  const dialog = [...harness.container.querySelectorAll('.dsh-td-link-card')]
+    .find((card) => (card.textContent ?? '').includes('确认删除节点？'))
+  assert.ok(dialog, 'Del opens the delete confirmation')
+  assert.match(dialog.textContent ?? '', /起点任务/)
+  await harness.act(async () => {
+    dialogButton(dialog, '确认删除').click()
+  })
+  await harness.settle(80)
+  const deletes = harness.actionRequests().filter((request) => request.action === 'delete-node')
+  assert.equal(deletes.length, 1)
+  assert.equal(deletes[0].payload.nodeId, 'n_a')
+  assert.equal(harness.graph.nodes.some((node) => node.id === 'n_a'), false)
+})
+
+test('Ctrl+drag copies one node without its edges', async (t) => {
+  const harness = await mountPanel(t)
+  await harness.act(async () => {
+    const card = harness.nodeCard('起点任务')
+    card.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: 0, clientY: 0, ctrlKey: true,
+    }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointermove', {
+      clientX: 120, clientY: 60, ctrlKey: true,
+    }))
+  })
+  await harness.settle()
+  assert.ok(harness.container.querySelector('g.dsh-td-duplicate-ghost'), 'a copy ghost follows the pointer')
+  await harness.act(async () => {
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', {
+      clientX: 120, clientY: 60, ctrlKey: true,
+    }))
+  })
+  await harness.settle(80)
+
+  const adds = harness.actionRequests().filter((request) => request.action === 'add-node')
+  assert.equal(adds.length, 1, 'one copy is created')
+  assert.equal(adds[0].payload.title, '起点任务')
+  assert.deepEqual(adds[0].payload.position, { x: 160, y: 100 }, 'the copy lands at the dragged position')
+  assert.equal(
+    harness.actionRequests().some((request) => request.action === 'set-positions'),
+    false,
+    'the original node is not moved',
+  )
+  assert.equal(
+    harness.container.querySelectorAll('g.dsh-td-node').length,
+    4,
+    'the original + the copy + the other two nodes render',
+  )
+  assert.equal(harness.container.querySelector('g.dsh-td-duplicate-ghost'), null, 'the ghost is cleared on drop')
+})
+
+test('Ctrl+drag copies the whole multi-selection at once', async (t) => {
+  const harness = await mountPanel(t)
+  await lassoSelect(harness, [
+    { x: 20, y: 20 },
+    { x: 660, y: 20 },
+    { x: 660, y: 150 },
+    { x: 20, y: 150 },
+    { x: 20, y: 20 },
+  ])
+  const panel = selectionPanel(harness)
+  assert.ok(panel)
+  await harness.act(async () => {
+    dialogButton(panel, '关闭').click()
+  })
+  await harness.settle()
+  assert.equal(selectionPanel(harness), null, 'closing the panel hides it')
+  assert.equal(
+    harness.container.querySelectorAll('g.dsh-td-node-group-target').length,
+    2,
+    'the multi-selection stays highlighted after closing the panel',
+  )
+
+  await harness.act(async () => {
+    const card = harness.nodeCard('起点任务')
+    card.dispatchEvent(pointer(harness.window, 'pointerdown', {
+      clientX: 0, clientY: 0, ctrlKey: true,
+    }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointermove', {
+      clientX: 80, clientY: 40, ctrlKey: true,
+    }))
+    harness.window.dispatchEvent(pointer(harness.window, 'pointerup', {
+      clientX: 80, clientY: 40, ctrlKey: true,
+    }))
+  })
+  await harness.settle(120)
+
+  const adds = harness.actionRequests().filter((request) => request.action === 'add-node')
+  assert.equal(adds.length, 2, 'every selected node is copied')
+  assert.deepEqual(adds.map((request) => request.payload.title).sort(), ['终点任务', '起点任务'])
+  assert.deepEqual(
+    adds.map((request) => request.payload.position).sort((left, right) => left.x - right.x),
+    [{ x: 120, y: 80 }, { x: 480, y: 80 }],
+    'the copies keep their relative offsets',
+  )
+  assert.equal(
+    harness.container.querySelectorAll('g.dsh-td-node-group-target').length,
+    2,
+    'the copies become the new multi-selection',
+  )
+})
+
 function contourBounds(d) {
   const points = []
   for (const segment of (typeof d === 'string' ? d : '').match(/[MLAZ][^MLAZ]*/g) ?? []) {

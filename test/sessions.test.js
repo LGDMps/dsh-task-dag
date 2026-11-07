@@ -12,8 +12,11 @@ import {
   archiveSession,
   buildBrief,
   createBlankSession,
+  invalidateProjectionsCache,
   listAgentPresets,
   listModelCatalog,
+  PROJECTIONS_CACHE_MS,
+  PROJECTIONS_CONCURRENCY,
   promptSession,
   readSessionEvents,
   readTail,
@@ -109,8 +112,15 @@ test('sessionFacts projects summaries, pressure ratio and archived ids', async (
 
   const facts = await sessionFacts(ctx, ['s1', 's2', 'missing', 's1'])
 
-  assert.equal(calls.length, 1)
+  // `s1` already has a usable pressure in the summary, so only `s2` needs the
+  // projection read; `missing` is never asked for.
+  assert.equal(calls.length, 2)
   assert.deepEqual(calls[0], { namespace: 'session', method: 'list', args: { _request: {} } })
+  assert.deepEqual(calls[1], {
+    namespace: 'session',
+    method: 'projections',
+    args: { request: { sessionId: 's2' } },
+  })
   assert.deepEqual(Object.keys(facts.byId).sort(), ['missing', 's1', 's2'])
   assert.equal(facts.byId.s1.title, '会话一')
   assert.equal(facts.byId.s1.running, true)
@@ -145,6 +155,165 @@ test('sessionFacts throws host-unavailable without a gateway, and wraps invoke e
     'host-unavailable',
     503,
   )
+})
+
+/** Gateway for the projection tests: `session/list` plus scripted projections. */
+function pressureGateway({ summaries, projections }) {
+  return gatewayStub({
+    invoke: (request) => {
+      if (request.namespace === 'session' && request.method === 'list') {
+        return { items: summaries }
+      }
+      if (request.namespace === 'session' && request.method === 'projections') {
+        const sessionId = request.args.request.sessionId
+        return typeof projections === 'function' ? projections(sessionId) : projections[sessionId]
+      }
+      throw new Error(`unexpected gateway call ${request.namespace}/${request.method}`)
+    },
+  })
+}
+
+test('sessionFacts fills contextPressure from session/projections', async () => {
+  const { gateway, calls } = pressureGateway({
+    summaries: [
+      { sessionId: 'seq', projections: { values: { title: '顺序投影' } } },
+      { sessionId: 'mig', projections: { values: { title: '迁移投影' } } },
+      { sessionId: 'bare', projections: { values: { title: '裸值投影' } } },
+    ],
+    projections: {
+      seq: {
+        kind: 'sequenced',
+        asOfSeq: 42,
+        values: {
+          contextPressure: { contextWindow: 100000, pressureTokens: 20000, projectedTokens: 60000 },
+        },
+      },
+      mig: {
+        kind: 'migration-required',
+        values: { contextPressure: { contextWindow: 80000, pressureTokens: 40000 } },
+      },
+      // A values map without the wrapper is tolerated too.
+      bare: { contextPressure: { contextWindow: 50000, projectedTokens: 10000 } },
+    },
+  })
+  const ctx = { typertGateway: gateway }
+
+  const facts = await sessionFacts(ctx, ['seq', 'mig', 'bare'])
+
+  assert.deepEqual(facts.byId.seq.contextPressure, {
+    contextWindow: 100000,
+    pressureTokens: 20000,
+    projectedTokens: 60000,
+    ratio: 0.6,
+  })
+  assert.deepEqual(facts.byId.mig.contextPressure, {
+    contextWindow: 80000,
+    pressureTokens: 40000,
+    ratio: 0.5,
+  })
+  assert.deepEqual(facts.byId.bare.contextPressure, {
+    contextWindow: 50000,
+    projectedTokens: 10000,
+    ratio: 0.2,
+  })
+  // Identity still comes from session/list.
+  assert.equal(facts.byId.seq.title, '顺序投影')
+  assert.equal(facts.byId.mig.available, true)
+
+  const pressureCalls = calls.filter((call) => call.method === 'projections')
+  assert.deepEqual(
+    pressureCalls.map((call) => call.args.request.sessionId).sort(),
+    ['bare', 'mig', 'seq'],
+  )
+  for (const call of pressureCalls) {
+    assert.equal(call.namespace, 'session')
+    assert.deepEqual(Object.keys(call.args), ['request'])
+  }
+})
+
+test('sessionFacts keeps every fact when projections are null, unknown or fail', async () => {
+  const { gateway } = pressureGateway({
+    summaries: [
+      { sessionId: 'null-proj', projections: { values: { title: '空投影' } } },
+      { sessionId: 'throwing', projections: { values: { title: '失败投影' } } },
+      { sessionId: 'weird', projections: { values: { title: '未知投影' } } },
+    ],
+    projections: (sessionId) => {
+      if (sessionId === 'null-proj') return null
+      if (sessionId === 'throwing') throw new Error('projections unavailable')
+      return { kind: 'sequenced', values: { contextPressure: { contextWindow: 'wide' } } }
+    },
+  })
+  const ctx = { typertGateway: gateway }
+
+  const facts = await sessionFacts(ctx, ['null-proj', 'throwing', 'weird', 'gone'])
+
+  assert.deepEqual(Object.keys(facts.byId).sort(), ['gone', 'null-proj', 'throwing', 'weird'])
+  for (const id of ['null-proj', 'throwing', 'weird']) {
+    assert.deepEqual(facts.byId[id].contextPressure, {}, `${id} must degrade to an empty water level`)
+    assert.equal(facts.byId[id].available, true)
+  }
+  assert.equal(facts.byId.throwing.title, '失败投影')
+  // The missing session keeps its existing warning behaviour.
+  assert.equal(facts.byId.gone.available, false)
+  assert.ok(facts.warnings.some((line) => line.includes('gone')))
+})
+
+test('sessionFacts caches one projection per session and refreshes it after the TTL', async () => {
+  let pressureReads = 0
+  const { gateway } = pressureGateway({
+    summaries: [{ sessionId: 'cached', projections: { values: { title: '缓存会话' } } }],
+    projections: () => {
+      pressureReads += 1
+      return {
+        kind: 'sequenced',
+        values: { contextPressure: { contextWindow: 1000, projectedTokens: pressureReads * 100 } },
+      }
+    },
+  })
+  const ctx = { typertGateway: gateway }
+  const start = 1_000_000
+
+  const first = await sessionFacts(ctx, ['cached'], start)
+  assert.equal(pressureReads, 1)
+  assert.equal(first.byId.cached.contextPressure.ratio, 0.1)
+
+  const cached = await sessionFacts(ctx, ['cached'], start + PROJECTIONS_CACHE_MS - 1)
+  assert.equal(pressureReads, 1, 'a refresh inside the TTL reuses the cached projection')
+  assert.equal(cached.byId.cached.contextPressure.ratio, 0.1)
+
+  const refreshed = await sessionFacts(ctx, ['cached'], start + PROJECTIONS_CACHE_MS)
+  assert.equal(pressureReads, 2, 'the first read after the TTL hits the gateway again')
+  assert.equal(refreshed.byId.cached.contextPressure.ratio, 0.2)
+
+  invalidateProjectionsCache(ctx)
+  await sessionFacts(ctx, ['cached'], start + PROJECTIONS_CACHE_MS)
+  assert.equal(pressureReads, 3, 'invalidating the context cache forces a fresh read')
+})
+
+test('sessionFacts reads many projections in parallel with a bounded pool', async () => {
+  const ids = Array.from({ length: 12 }, (_, index) => `par-${index}`)
+  let inFlight = 0
+  let maxInFlight = 0
+  const { gateway } = pressureGateway({
+    summaries: ids.map((sessionId) => ({ sessionId, projections: { values: { title: sessionId } } })),
+    projections: async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return {
+        kind: 'sequenced',
+        values: { contextPressure: { contextWindow: 1000, pressureTokens: 250 } },
+      }
+    },
+  })
+
+  const facts = await sessionFacts({ typertGateway: gateway }, ids)
+
+  assert.equal(maxInFlight, PROJECTIONS_CONCURRENCY, 'the pool must respect its concurrency limit')
+  assert.equal(Object.keys(facts.byId).length, ids.length)
+  for (const id of ids) assert.equal(facts.byId[id].contextPressure.ratio, 0.25)
 })
 
 /* ------------------------------------------------------------------ */

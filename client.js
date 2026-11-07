@@ -506,6 +506,22 @@ window.__ModuleLoader__.load({
       'stroke-width:1.2;stroke-dasharray:6 4;pointer-events:none}',
       '.dsh-td-lasso-count{fill:var(--dsw-alias-brand-primary);font-size:var(--dsh-td-fs-xs);font-family:inherit;',
       'paint-order:stroke;stroke:var(--dsw-alias-bg-base);stroke-width:3px;pointer-events:none}',
+      // second-click rectangle selection (Alt + click, move, click)
+      '.dsh-td-marquee{fill:var(--dsw-alias-brand-primary);fill-opacity:.06;stroke:var(--dsw-alias-brand-primary);',
+      'stroke-width:1.2;stroke-dasharray:5 4;pointer-events:none}',
+      '.dsh-td-marquee-count{fill:var(--dsw-alias-brand-primary);font-size:var(--dsh-td-fs-xs);font-family:inherit;',
+      'paint-order:stroke;stroke:var(--dsw-alias-bg-base);stroke-width:3px;pointer-events:none}',
+      // multi-node selection (lasso/rectangle result) and the ctrl-drag copy ghost
+      '.dsh-td-node-multi .dsh-td-node-bg{stroke:var(--dsw-alias-brand-primary);stroke-width:1.8}',
+      '.dsh-td-duplicate-ghost{opacity:.55;pointer-events:none}',
+      '.dsh-td-duplicate-ghost-bg{fill:var(--dsw-alias-bg-layer-2);stroke:var(--dsw-alias-brand-primary);',
+      'stroke-width:1.4;stroke-dasharray:6 4}',
+      '.dsh-td-duplicate-ghost-title{fill:var(--dsw-alias-label-primary);font-size:var(--dsh-td-fs);font-family:inherit}',
+      '.dsh-td-selection-list{display:flex;flex-direction:column;gap:6px;margin-top:8px}',
+      '.dsh-td-selection-item{font-size:var(--dsh-td-fs-sm);color:var(--dsw-alias-label-secondary);overflow:hidden;',
+      'text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-td-selection-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}',
+      '.dsh-td-delete-warn{font-size:var(--dsh-td-fs-sm);color:var(--dsw-alias-state-warn-primary);line-height:1.6}',
       '@keyframes dsh-td-breathe{0%,100%{opacity:.25}50%{opacity:1}}',
 
       // detail drawer
@@ -3866,6 +3882,7 @@ window.__ModuleLoader__.load({
       if (status === 'failed') classes.push('dsh-td-node-failed')
       if (scheduled) classes.push('dsh-td-node-scheduled')
       if (isMilestone) classes.push('dsh-td-node-milestone')
+      if (props.multiSelected) classes.push('dsh-td-node-multi')
 
       let meta = statusLabel(status)
       if (showReady) meta += ' · 可开始'
@@ -3989,15 +4006,21 @@ window.__ModuleLoader__.load({
       const [dragPos, setDragPos] = useState(null)
       const [linkCursor, setLinkCursor] = useState(null)
       const [lasso, setLasso] = useState(null)
+      const [rectSelection, setRectSelection] = useState(null)
+      const [duplicateGhost, setDuplicateGhost] = useState(null)
       const [onlyReady, setOnlyReady] = useState(false)
       const fittedRef = useRef(false)
       const viewportRef = useRef(viewport)
       viewportRef.current = viewport
+      const rectSelectionRef = useRef(null)
+      rectSelectionRef.current = rectSelection
 
       latest.current = {
         model,
         viewport,
         layoutMode: props.layoutMode,
+        selectedNodeId: props.selectedNodeId,
+        selectedNodeIds: Array.isArray(props.selectedNodeIds) ? props.selectedNodeIds : [],
         selectedEdgeId: props.selectedEdgeId,
         onSelectNode: props.onSelectNode,
         onSelectEdge: props.onSelectEdge,
@@ -4005,7 +4028,9 @@ window.__ModuleLoader__.load({
         onRequestLink: props.onRequestLink,
         onDeleteEdge: props.onDeleteEdge,
         onUndo: props.onUndo,
-        onLasso: props.onLasso,
+        onSelectMany: props.onSelectMany,
+        onDuplicateNodes: props.onDuplicateNodes,
+        onRequestDelete: props.onRequestDelete,
       }
 
       // Keep the optimistic drop frame until the Host snapshot confirms it.
@@ -4027,6 +4052,18 @@ window.__ModuleLoader__.load({
         const timer = setTimeout(() => setDragPos(null), 2500)
         return () => clearTimeout(timer)
       }, [dragPos, model])
+
+      // A workspace switch must not leave a half-finished lasso, rectangle or
+      // Ctrl-copy preview pointing at nodes from the old project.
+      useEffect(() => {
+        interactionRef.current = null
+        setPanning(false)
+        setDragPos(null)
+        setLinkCursor(null)
+        setLasso(null)
+        setRectSelection(null)
+        setDuplicateGhost(null)
+      }, [props.workspaceKey])
 
       // -- viewport persistence (debounced; the object is tiny) -------------
       useEffect(() => {
@@ -4172,6 +4209,43 @@ window.__ModuleLoader__.load({
             setLinkCursor({ from: interaction.from, x: point.x, y: point.y })
             return
           }
+          if (interaction.kind === 'altSelect') {
+            // A click without movement becomes the first corner of a rectangle
+            // selection; as soon as the pointer moves it becomes a freehand lasso.
+            const screenDelta = Math.abs(event.clientX - interaction.startClientX)
+              + Math.abs(event.clientY - interaction.startClientY)
+            if (screenDelta <= 3) return
+            interaction.kind = 'lasso'
+            interaction.moved = true
+            const start = toWorld(event.clientX, event.clientY, latest.current.viewport)
+            interaction.points.push(start)
+            interaction.last = start
+            setLasso(interaction.points.slice())
+            return
+          }
+          if (interaction.kind === 'duplicate') {
+            const screenDelta = Math.abs(event.clientX - interaction.clientX)
+              + Math.abs(event.clientY - interaction.clientY)
+            if (screenDelta > 3) interaction.moved = true
+            if (!interaction.moved) return
+            const scale = interaction.viewport.scale || 1
+            const dx = (event.clientX - interaction.clientX) / scale
+            const dy = (event.clientY - interaction.clientY) / scale
+            const sourceNodes = latest.current.model.nodeById
+            const ghostNodes = []
+            for (const nodeId of interaction.sourceIds) {
+              const origin = interaction.origins[nodeId]
+              if (origin === undefined) continue
+              const node = sourceNodes[nodeId]
+              ghostNodes.push({
+                title: node !== undefined ? node.title : '',
+                x: Math.round(origin.x + dx),
+                y: Math.round(origin.y + dy),
+              })
+            }
+            setDuplicateGhost(ghostNodes.length === 0 ? null : { nodes: ghostNodes })
+            return
+          }
           if (interaction.kind === 'lasso') {
             const point = toWorld(event.clientX, event.clientY, latest.current.viewport)
             if (distanceBetween(point, interaction.last) < 2.5) return
@@ -4258,14 +4332,33 @@ window.__ModuleLoader__.load({
             settlePending(handlers.onMoveNode(interaction.nodeId, position, displaced, interaction.beforePositions))
             return
           }
+          if (interaction.kind === 'altSelect') {
+            // Alt-click (no drag): remember the first corner; the next click
+            // confirms the rectangle.
+            const anchor = interaction.points[0]
+            setLasso(null)
+            setRectSelection({ anchor: { x: anchor.x, y: anchor.y }, current: { x: anchor.x, y: anchor.y } })
+            return
+          }
+          if (interaction.kind === 'duplicate') {
+            setDuplicateGhost(null)
+            if (!interaction.moved) return
+            const scale = interaction.viewport.scale || 1
+            const delta = {
+              x: Math.round((event.clientX - interaction.clientX) / scale),
+              y: Math.round((event.clientY - interaction.clientY) / scale),
+            }
+            handlers.onDuplicateNodes(interaction.sourceIds.slice(), delta)
+            return
+          }
           if (interaction.kind === 'lasso') {
             const points = interaction.points
             setLasso(null)
             if (points.length < 3) {
-              handlers.onLasso([])
+              handlers.onSelectMany([], 'lasso')
               return
             }
-            handlers.onLasso(nodesFullyInside(points))
+            handlers.onSelectMany(nodesFullyInside(points), 'lasso')
             return
           }
           if (interaction.kind === 'link') {
@@ -4302,7 +4395,7 @@ window.__ModuleLoader__.load({
         return () => element.removeEventListener('wheel', onWheel)
       }, [])
 
-      // -- keyboard: Escape clears, Delete removes the selected edge --------
+      // -- keyboard: Escape cancels, Delete removes the selection -----------
       useEffect(() => {
         function onKeyDown(event) {
           const target = event.target
@@ -4313,9 +4406,16 @@ window.__ModuleLoader__.load({
             || (target !== null && target !== undefined && target.isContentEditable === true)) return
           const handlers = latest.current
           if (event.key === 'Escape') {
-            if (interactionRef.current !== null && interactionRef.current.kind === 'lasso') {
+            const interaction = interactionRef.current
+            if (interaction !== null && interaction.kind !== null && interaction.kind !== 'pan'
+              && interaction.kind !== 'node' && interaction.kind !== 'link') {
               interactionRef.current = null
               setLasso(null)
+              setDuplicateGhost(null)
+              return
+            }
+            if (rectSelectionRef.current !== null) {
+              setRectSelection(null)
               return
             }
             handlers.onSelectEdge(null)
@@ -4329,21 +4429,73 @@ window.__ModuleLoader__.load({
             if (typeof handlers.onUndo === 'function') handlers.onUndo()
             return
           }
-          if ((event.key === 'Delete' || event.key === 'Backspace') && typeof handlers.selectedEdgeId === 'string') {
-            event.preventDefault()
-            handlers.onDeleteEdge(handlers.selectedEdgeId)
+          if (event.key === 'Delete' || event.key === 'Backspace') {
+            const multi = Array.isArray(handlers.selectedNodeIds) ? handlers.selectedNodeIds : []
+            if (multi.length > 0 && typeof handlers.onRequestDelete === 'function') {
+              event.preventDefault()
+              handlers.onRequestDelete(multi.slice())
+              return
+            }
+            if (typeof handlers.selectedNodeId === 'string' && handlers.selectedNodeId !== ''
+              && typeof handlers.onRequestDelete === 'function') {
+              event.preventDefault()
+              handlers.onRequestDelete([handlers.selectedNodeId])
+              return
+            }
+            if (typeof handlers.selectedEdgeId === 'string') {
+              event.preventDefault()
+              handlers.onDeleteEdge(handlers.selectedEdgeId)
+            }
           }
         }
         window.addEventListener('keydown', onKeyDown)
         return () => window.removeEventListener('keydown', onKeyDown)
       }, [])
 
+      // -- Alt click, move, click again: rectangle selection -----------------
+      // The first click is captured on pointer-up; while the mode is active the
+      // rectangle follows the pointer and the next pointer-down confirms it.
+      const rectActive = rectSelection !== null
+      useEffect(() => {
+        if (!rectActive) return undefined
+        function onMove(event) {
+          const point = toWorld(event.clientX, event.clientY, latest.current.viewport)
+          setRectSelection((current) => (current === null
+            ? current
+            : { anchor: current.anchor, current: { x: point.x, y: point.y } }))
+        }
+        function onDown(event) {
+          if (event.button !== 0) {
+            if (event.button === 2) setRectSelection(null)
+            return
+          }
+          const selection = rectSelectionRef.current
+          if (selection === null) return
+          event.preventDefault()
+          event.stopPropagation()
+          setRectSelection(null)
+          const rect = {
+            left: Math.min(selection.anchor.x, selection.current.x),
+            top: Math.min(selection.anchor.y, selection.current.y),
+            right: Math.max(selection.anchor.x, selection.current.x),
+            bottom: Math.max(selection.anchor.y, selection.current.y),
+          }
+          latest.current.onSelectMany(nodesInsideRect(rect), 'rect')
+        }
+        window.addEventListener('pointermove', onMove)
+        window.addEventListener('pointerdown', onDown, true)
+        return () => {
+          window.removeEventListener('pointermove', onMove)
+          window.removeEventListener('pointerdown', onDown, true)
+        }
+      }, [rectActive])
+
       function startPan(event) {
         if (event.button !== 0) return
-        // Alt + left drag draws a lasso instead of panning: the released shape
-        // selects every node it fully encloses.
+        // Alt + left drag draws a lasso; an Alt click without movement starts a
+        // two-click rectangle selection instead (the gesture is decided on move).
         if (event.altKey) {
-          startLasso(event)
+          beginAltSelection(event)
           return
         }
         const view = latest.current.viewport
@@ -4357,15 +4509,19 @@ window.__ModuleLoader__.load({
         setPanning(true)
       }
 
-      function startLasso(event) {
+      function beginAltSelection(event) {
         event.preventDefault()
         const point = toWorld(event.clientX, event.clientY, latest.current.viewport)
         interactionRef.current = {
-          kind: 'lasso',
+          kind: 'altSelect',
           points: [point],
           last: point,
+          startClientX: event.clientX,
+          startClientY: event.clientY,
+          moved: false,
         }
-        setLasso([point])
+        setRectSelection(null)
+        setLasso(null)
       }
 
       /** Nodes whose whole card is inside the closed hand-drawn polygon. */
@@ -4381,12 +4537,54 @@ window.__ModuleLoader__.load({
         return selected
       }
 
+      /** Nodes whose whole card is inside the axis-aligned rectangle. */
+      function nodesInsideRect(rect) {
+        const positions = positionsRef.current
+        const nodes = latest.current.model.nodes
+        const selected = []
+        for (const node of nodes) {
+          const position = positions[node.id]
+          if (position === undefined) continue
+          if (position.x >= rect.left && position.x + NODE_W <= rect.right
+            && position.y >= rect.top && position.y + NODE_H <= rect.bottom) {
+            selected.push(node.id)
+          }
+        }
+        return selected
+      }
+
       function startNodeDrag(event, node) {
         if (event.button !== 0) return
         if (event.altKey) {
           // The lasso may start on top of a card as well as on empty canvas.
           event.stopPropagation()
-          startLasso(event)
+          beginAltSelection(event)
+          return
+        }
+        if (event.ctrlKey || event.metaKey) {
+          // Ctrl + drag copies the node (or the whole multi-selection) instead
+          // of moving it; the copies are only created on pointer-up.
+          event.stopPropagation()
+          event.preventDefault()
+          const multi = latest.current.selectedNodeIds
+          const sourceIds = multi.length > 1 && multi.indexOf(node.id) >= 0 ? multi.slice() : [node.id]
+          const origins = {}
+          for (const nodeId of sourceIds) {
+            const point = positionsRef.current[nodeId]
+            if (point !== undefined) origins[nodeId] = { x: point.x, y: point.y }
+          }
+          const usable = sourceIds.filter((nodeId) => origins[nodeId] !== undefined)
+          if (usable.length === 0) return
+          const view = latest.current.viewport
+          interactionRef.current = {
+            kind: 'duplicate',
+            sourceIds: usable,
+            origins,
+            clientX: event.clientX,
+            clientY: event.clientY,
+            viewport: { x: view.x, y: view.y, scale: view.scale },
+            moved: false,
+          }
           return
         }
         event.stopPropagation()
@@ -4417,7 +4615,7 @@ window.__ModuleLoader__.load({
         if (event.button !== 0) return
         if (event.altKey) {
           event.stopPropagation()
-          startLasso(event)
+          beginAltSelection(event)
           return
         }
         event.stopPropagation()
@@ -4476,9 +4674,17 @@ window.__ModuleLoader__.load({
 
       const lassoHits = lasso !== null ? nodesFullyInside(lasso) : []
       const lassoPath = lasso !== null ? closedPolylinePath(lasso) : ''
-      const pendingGroupTargets = new Set(
-        Array.isArray(props.pendingGroupNodeIds) ? props.pendingGroupNodeIds : [],
-      )
+      const multiSelectedIds = new Set(Array.isArray(props.selectedNodeIds) ? props.selectedNodeIds : [])
+      let rectPreview = null
+      if (rectSelection !== null) {
+        const rect = {
+          left: Math.min(rectSelection.anchor.x, rectSelection.current.x),
+          top: Math.min(rectSelection.anchor.y, rectSelection.current.y),
+          right: Math.max(rectSelection.anchor.x, rectSelection.current.x),
+          bottom: Math.max(rectSelection.anchor.y, rectSelection.current.y),
+        }
+        rectPreview = Object.assign(rect, { count: nodesInsideRect(rect).length })
+      }
 
       // Node rectangles padded by the routing clearance. Other nodes use the
       // padded rectangle; the edge's own two endpoints use the exact rectangle
@@ -4519,7 +4725,7 @@ window.__ModuleLoader__.load({
             onPointerDown: (event) => {
               event.stopPropagation()
               if (event.altKey) {
-                startLasso(event)
+                beginAltSelection(event)
                 return
               }
               props.onSelectEdge(edge.id)
@@ -4547,7 +4753,8 @@ window.__ModuleLoader__.load({
           selected: props.selectedNodeId === node.id,
           dimmed: onlyReady && !model.ready.has(node.id),
           emphasized: onlyReady && model.ready.has(node.id),
-          groupTarget: pendingGroupTargets.has(node.id) || lassoHits.indexOf(node.id) >= 0,
+          groupTarget: lassoHits.indexOf(node.id) >= 0 || multiSelectedIds.has(node.id),
+          multiSelected: multiSelectedIds.has(node.id),
           dragging: dragPos !== null && dragPos.nodeId === node.id,
           onNodePointerDown: startNodeDrag,
           onStartLink: startLinkDrag,
@@ -4571,7 +4778,7 @@ window.__ModuleLoader__.load({
             onPointerDown: (event) => {
               event.stopPropagation()
               if (event.altKey) {
-                startLasso(event)
+                beginAltSelection(event)
                 return
               }
               if (typeof props.onSelectGroup === 'function') props.onSelectGroup(shape.group.id)
@@ -4594,6 +4801,45 @@ window.__ModuleLoader__.load({
             x: round1(lasso[0].x + 12),
             y: round1(lasso[0].y - 10),
           }, '完全包含 ' + String(lassoHits.length) + ' 个节点'))
+
+      const marqueeElement = rectPreview === null
+        ? null
+        : h('g', { className: 'dsh-td-marquee-layer' },
+          h('rect', {
+            className: 'dsh-td-marquee',
+            x: round1(rectPreview.left),
+            y: round1(rectPreview.top),
+            width: round1(Math.max(0, rectPreview.right - rectPreview.left)),
+            height: round1(Math.max(0, rectPreview.bottom - rectPreview.top)),
+          }),
+          h('text', {
+            className: 'dsh-td-marquee-count',
+            x: round1(rectPreview.left + 10),
+            y: round1(rectPreview.top - 8),
+          }, '完全包含 ' + String(rectPreview.count) + ' 个节点'))
+
+      let duplicateGhostElement = null
+      if (duplicateGhost !== null && duplicateGhost.nodes.length > 0) {
+        duplicateGhostElement = h('g', { className: 'dsh-td-duplicate-ghost' },
+          duplicateGhost.nodes.map((item, index) => h('g', {
+            key: 'copy' + String(index),
+            transform: 'translate(' + round1(item.x) + ' ' + round1(item.y) + ')',
+          },
+          h('rect', {
+            className: 'dsh-td-duplicate-ghost-bg',
+            x: 0,
+            y: 0,
+            width: NODE_W,
+            height: NODE_H,
+            rx: 10,
+            ry: 10,
+          }),
+          h('text', {
+            className: 'dsh-td-duplicate-ghost-title',
+            x: 16,
+            y: 40,
+          }, titleLines(item.title)[0]))))
+      }
 
       let ghostEdge = null
       if (linkCursor !== null) {
@@ -4732,6 +4978,8 @@ window.__ModuleLoader__.load({
             ghostEdge,
             nodeElements,
             lassoElement,
+            marqueeElement,
+            duplicateGhostElement,
           ),
         ),
         h('div', { className: 'dsh-td-toolbar' },
@@ -4769,7 +5017,7 @@ window.__ModuleLoader__.load({
         ),
         h('div', { className: 'dsh-td-canvas-hint' },
           '滚轮缩放 · 拖背景平移 · 拖节点移动 · 双击空白新建 · 从节点右侧圆点拖到另一个节点选择前置条件'
-          + ' · Alt+左键圈选节点成组 · Ctrl+Z 撤销拖动/自动布局'),
+          + ' · Alt+拖动自由圈选 / Alt+单击后单击矩形选择 · Ctrl+拖动复制节点 · Del 删除选中 · Ctrl+Z 撤销拖动/自动布局'),
         edgeBar,
         groupBar,
       )
@@ -4943,7 +5191,7 @@ window.__ModuleLoader__.load({
             h('div', null,
               h('div', { className: 'dsh-td-link-title' }, creating ? '给选中的节点组合命名' : '重命名组合'),
               h('div', { className: 'dsh-td-link-sub' }, creating
-                ? '已完全包含 ' + String(props.nodeCount) + ' 个节点（仅相交的不计入）。确认后在它们外围画一圈对齐布局网格的虚线轮廓。'
+                ? '已完全包含 ' + String(props.nodeCount) + ' 个节点（仅相交的不计入）。确认后在它们外围画一圈虚线轮廓。'
                 : '新名称会显示在虚线轮廓的左上角。')),
             h('button', {
               type: 'button',
@@ -4988,9 +5236,145 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // After a lasso or a rectangle selection: the selection is kept, and the
+    // user picks what to do with it. Deleting always asks once more.
+    function SelectionPanel(props) {
+      const count = Number(props.count) || 0
+      useEffect(() => {
+        function onKeyDown(event) {
+          if (event.key !== 'Escape') return
+          // A dialog stacked on top (group naming / delete confirmation) owns
+          // Escape; only close the panel when it is the topmost layer.
+          if (document.querySelectorAll('.dsh-td-link-card').length > 1) return
+          props.onClose()
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+      }, [props.onClose])
+
+      return h('div', { className: 'dsh-td-link-layer' },
+        h('div', {
+          className: 'dsh-td-link-card',
+          role: 'dialog',
+          'aria-label': '选中节点操作',
+        },
+          h('div', { className: 'dsh-td-link-head' },
+            h('div', null,
+              h('div', { className: 'dsh-td-link-title' }, '已选中 ' + String(count) + ' 个节点'),
+              h('div', { className: 'dsh-td-link-sub' },
+                '可以组成组合，或删除这些节点。关闭面板后选中状态会保留；'
+                + '按住 Ctrl 拖动其中一个节点，可以一次复制整批选中节点。')),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text dsh-td-close',
+              title: '关闭',
+              onClick: props.onClose,
+            }, '×'),
+          ),
+          h('div', { className: 'dsh-td-selection-actions' },
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-primary',
+              disabled: count < 2,
+              title: count < 2 ? '至少选中两个节点才能组合' : '把选中的节点圈进一个组合',
+              onClick: props.onGroup,
+            }, '组合'),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-danger',
+              onClick: props.onDelete,
+            }, '删除'),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+              onClick: props.onClose,
+            }, '关闭'),
+          ),
+        ),
+      )
+    }
+
+    // One confirmation for both Del on a selected node and the selection
+    // panel's delete action.
+    function DeleteNodesDialog(props) {
+      const titles = Array.isArray(props.titles) ? props.titles : []
+      const count = titles.length
+      const [submitting, setSubmitting] = useState(false)
+      useEffect(() => {
+        function onKeyDown(event) {
+          if (event.key === 'Escape' && !submitting) props.onCancel()
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+      }, [props.onCancel, submitting])
+
+      async function confirm() {
+        if (submitting) return
+        setSubmitting(true)
+        try {
+          const result = await props.onConfirm()
+          if (result !== null && result !== undefined && result.ok === true) props.onDone()
+        } finally {
+          setSubmitting(false)
+        }
+      }
+
+      const shown = titles.slice(0, 8)
+      return h('div', { className: 'dsh-td-link-layer' },
+        h('div', {
+          className: 'dsh-td-link-card',
+          role: 'dialog',
+          'aria-label': '确认删除节点',
+        },
+          h('div', { className: 'dsh-td-link-head' },
+            h('div', null,
+              h('div', { className: 'dsh-td-link-title' }, '确认删除节点？'),
+              h('div', { className: 'dsh-td-link-sub' }, count === 1
+                ? '将删除「' + (titles[0] || '该节点') + '」。'
+                : '将删除选中的 ' + String(count) + ' 个节点。')),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text dsh-td-close',
+              title: '取消',
+              disabled: submitting,
+              onClick: props.onCancel,
+            }, '×'),
+          ),
+          h('div', { className: 'dsh-td-delete-warn' },
+            '上游任务会按「拼接」方式保留后继节点的前置约束；整条会话链会归档（可在侧栏恢复）。'
+            + '此操作不可撤销。'),
+          shown.length > 1
+            ? h('div', { className: 'dsh-td-selection-list' },
+              shown.map((title, index) => h('div', {
+                key: 'del' + String(index),
+                className: 'dsh-td-selection-item',
+                title,
+              }, '· ' + title)),
+              titles.length > shown.length
+                ? h('div', { className: 'dsh-td-selection-item' },
+                  '· 其余 ' + String(titles.length - shown.length) + ' 个节点')
+                : null)
+            : null,
+          h('div', { className: 'dsh-td-link-foot' },
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+              disabled: submitting,
+              onClick: props.onCancel,
+            }, '取消'),
+            h('button', {
+              type: 'button',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-danger',
+              disabled: submitting,
+              onClick: confirm,
+            }, submitting ? '删除中…' : count > 1 ? '确认删除 ' + String(count) + ' 个节点' : '确认删除'),
+          ),
+        ),
+      )
+    }
+
     /** First free「组合 N」suggestion, so the dialog opens with a usable name. */
-    function nextGroupName(groups) {
-      const used = new Set((Array.isArray(groups) ? groups : []).map((group) => group.name))
+    function nextGroupName(groups) {      const used = new Set((Array.isArray(groups) ? groups : []).map((group) => group.name))
       let index = (Array.isArray(groups) ? groups.length : 0) + 1
       while (used.has('组合 ' + String(index))) index += 1
       return '组合 ' + String(index)
@@ -6486,10 +6870,12 @@ window.__ModuleLoader__.load({
       )
       const [selectedEdgeId, setSelectedEdgeId] = useState(null)
       const [selectedGroupId, setSelectedGroupId] = useState(null)
+      // Multi-selection from the lasso or the two-click rectangle. It outlives
+      // the action panel so Ctrl+drag can copy the whole selection.
+      const [selectedNodeIds, setSelectedNodeIds] = useState([])
+      const [selectionDraft, setSelectionDraft] = useState(null)
+      const [deleteDraft, setDeleteDraft] = useState(null)
       const [groupDraft, setGroupDraft] = useState(null)
-      // Nodes the pending lasso enclosed: highlighted from pointer-up until the
-      // group dialog is confirmed or cancelled.
-      const [pendingGroupIds, setPendingGroupIds] = useState([])
       const [focusTitle, setFocusTitle] = useState(false)
       const [workspaces, setWorkspaces] = useState({ phase: 'loading', items: [], fallback: false })
       const [state, setState] = useState({ phase: 'idle', snapshot: null, error: null })
@@ -6853,10 +7239,12 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         // Position undo is workspace-scoped: a snapshot from another project
-        // must never be posted as positions to this one. A pending group is
-        // workspace-scoped for the same reason.
+        // must never be posted as positions to this one. Selection and the
+        // selection/delete dialogs are workspace-scoped for the same reason.
         dropUndoStack()
-        setPendingGroupIds([])
+        setSelectedNodeIds([])
+        setSelectionDraft(null)
+        setDeleteDraft(null)
         setGroupDraft(null)
         setSelectedGroupId(null)
         if (workspaceId === null) {
@@ -6936,6 +7324,20 @@ window.__ModuleLoader__.load({
         if (selectedGroupId !== null && model.groups.every((group) => group.id !== selectedGroupId)) {
           setSelectedGroupId(null)
         }
+        setSelectedNodeIds((current) => {
+          const next = current.filter((nodeId) => model.nodeIds.has(nodeId))
+          return next.length === current.length ? current : next
+        })
+        setSelectionDraft((current) => {
+          if (current === null) return current
+          const next = current.nodeIds.filter((nodeId) => model.nodeIds.has(nodeId))
+          return next.length === 0 ? null : { nodeIds: next }
+        })
+        setDeleteDraft((current) => {
+          if (current === null) return current
+          const next = current.nodeIds.filter((nodeId) => model.nodeIds.has(nodeId))
+          return next.length === 0 ? null : { nodeIds: next }
+        })
       }, [state.snapshot, model, selectedNodeId, selectedEdgeId, selectedGroupId])
 
       const currentWorkspace = useMemo(() => {
@@ -7019,6 +7421,9 @@ window.__ModuleLoader__.load({
       const handleSelectNode = useCallback((nodeId) => {
         flushDrafts()
         setSelectedNodeId(typeof nodeId === 'string' && nodeId !== '' ? nodeId : null)
+        setSelectedNodeIds([])
+        setSelectionDraft(null)
+        setDeleteDraft(null)
         setSelectedEdgeId(null)
         setSelectedGroupId(null)
         setFocusTitle(false)
@@ -7028,6 +7433,9 @@ window.__ModuleLoader__.load({
         flushDrafts()
         setSelectedEdgeId(edgeId)
         setSelectedGroupId(null)
+        setSelectedNodeIds([])
+        setSelectionDraft(null)
+        setDeleteDraft(null)
       }, [flushDrafts])
 
       const handleSelectGroup = useCallback((groupId) => {
@@ -7035,27 +7443,151 @@ window.__ModuleLoader__.load({
         setSelectedGroupId(typeof groupId === 'string' && groupId !== '' ? groupId : null)
         setSelectedNodeId(null)
         setSelectedEdgeId(null)
+        setSelectedNodeIds([])
+        setSelectionDraft(null)
+        setDeleteDraft(null)
         setFocusTitle(false)
       }, [flushDrafts])
 
-      // -- lasso groups ------------------------------------------------------
-      const handleLasso = useCallback((nodeIds) => {
-        const list = Array.isArray(nodeIds) ? nodeIds.filter((nodeId) => typeof nodeId === 'string' && nodeId !== '') : []
-        setPendingGroupIds(list)
+      // -- lasso / rectangle selection and the actions panel -----------------
+      const handleSelectMany = useCallback((nodeIds, method) => {
+        flushDrafts()
+        const list = Array.isArray(nodeIds)
+          ? nodeIds.filter((nodeId) => typeof nodeId === 'string' && nodeId !== '')
+          : []
+        setSelectedNodeId(null)
+        setSelectedEdgeId(null)
+        setSelectedGroupId(null)
+        setDeleteDraft(null)
+        setSelectedNodeIds(list)
         if (list.length === 0) {
-          showNotice('warn', '圈选路径里没有完全包含的节点（只碰到边的不计入）')
+          setSelectionDraft(null)
+          showNotice('warn', method === 'rect'
+            ? '矩形范围内没有完全包含的节点（只碰到边的不计入）'
+            : '圈选路径里没有完全包含的节点（只碰到边的不计入）')
           return
         }
-        if (list.length < 2) {
-          showNotice('warn', '组合至少需要两个节点：请把节点整个圈进去')
+        setSelectionDraft({ nodeIds: list })
+      }, [flushDrafts, showNotice])
+
+      const handleCloseSelectionPanel = useCallback(() => {
+        // Closing keeps the multi-selection so Ctrl+drag can copy it.
+        setSelectionDraft(null)
+      }, [])
+
+      const handleGroupSelection = useCallback(() => {
+        const draft = selectionDraft
+        if (draft === null) return
+        if (draft.nodeIds.length < 2) {
+          showNotice('warn', '组合至少需要两个节点')
           return
         }
-        setGroupDraft({ mode: 'create', nodeIds: list })
-      }, [showNotice])
+        setGroupDraft({ mode: 'create', nodeIds: draft.nodeIds.slice() })
+      }, [selectionDraft, showNotice])
+
+      const handleDeleteSelection = useCallback(() => {
+        const draft = selectionDraft
+        if (draft === null) return
+        setDeleteDraft({ nodeIds: draft.nodeIds.slice() })
+      }, [selectionDraft])
+
+      const handleRequestDelete = useCallback((nodeIds) => {
+        const list = (Array.isArray(nodeIds) ? nodeIds : [])
+          .filter((nodeId) => typeof nodeId === 'string' && model.nodeIds.has(nodeId))
+        if (list.length === 0) return
+        setDeleteDraft({ nodeIds: list })
+      }, [model])
+
+      const dropDeleteDraft = useCallback(() => setDeleteDraft(null), [])
+
+      const handleConfirmDelete = useCallback(async () => {
+        const draft = deleteDraft
+        if (draft === null) return { ok: false, code: 'no-draft' }
+        const ids = draft.nodeIds.filter((nodeId) => model.nodeIds.has(nodeId))
+        if (ids.length === 0) {
+          setDeleteDraft(null)
+          return { ok: false, code: 'gone' }
+        }
+        let deleted = 0
+        for (const nodeId of ids) {
+          const result = await runAction('delete-node', {
+            nodeId,
+            mode: 'splice',
+            archiveSessions: true,
+          })
+          if (result === null || result === undefined || result.ok !== true) break
+          deleted += 1
+        }
+        if (deleted > 0) {
+          setDeleteDraft(null)
+          setSelectionDraft(null)
+          setSelectedNodeIds([])
+          setSelectedNodeId(null)
+          showNotice(deleted === ids.length ? 'info' : 'warn', deleted === ids.length
+            ? (deleted === 1 ? '已删除节点' : '已删除 ' + String(deleted) + ' 个节点')
+            : '已删除 ' + String(deleted) + ' 个节点，其余节点删除失败，请重试')
+        }
+        return { ok: deleted === ids.length, deleted, total: ids.length }
+      }, [deleteDraft, model, runAction, showNotice])
+
+      // -- Ctrl + drag duplicates the node (or the whole selection) ---------
+      const handleDuplicateNodes = useCallback(async (sourceIds, delta) => {
+        flushDrafts()
+        const sources = (Array.isArray(sourceIds) ? sourceIds : [])
+          .map((nodeId) => model.nodeById[nodeId])
+          .filter((node) => node !== undefined)
+        if (sources.length === 0) {
+          showNotice('warn', '没有可复制的节点')
+          return
+        }
+        const dx = Number.isFinite(Number(delta !== null && typeof delta === 'object' ? delta.x : NaN))
+          ? Math.round(Number(delta.x))
+          : 0
+        const dy = Number.isFinite(Number(delta !== null && typeof delta === 'object' ? delta.y : NaN))
+          ? Math.round(Number(delta.y))
+          : 0
+        const createdIds = []
+        const seen = new Set(model.nodeIds)
+        for (const source of sources) {
+          const origin = model.positions[source.id] !== undefined ? model.positions[source.id] : source.position
+          if (origin === null || origin === undefined) continue
+          const payload = {
+            title: source.title,
+            notes: typeof source.notes === 'string' ? source.notes : '',
+            position: { x: Math.round(origin.x + dx), y: Math.round(origin.y + dy) },
+          }
+          // Copy only the node's own settings. Conditions, edges, sessions,
+          // schedule, status and milestone deliberately stay with the original.
+          for (const key of ['agentPreset', 'model', 'reasoningEffort']) {
+            if (typeof source[key] === 'string' && source[key] !== '') payload[key] = source[key]
+          }
+          const result = await runAction('add-node', payload)
+          if (result === null || result === undefined || result.ok !== true) break
+          const nodes = result.snapshot !== null && result.snapshot !== undefined
+            && result.snapshot.graph !== null && typeof result.snapshot.graph === 'object'
+            && Array.isArray(result.snapshot.graph.nodes)
+            ? result.snapshot.graph.nodes
+            : []
+          const created = nodes.find((node) => !seen.has(node.id))
+          if (created !== undefined) {
+            seen.add(created.id)
+            createdIds.push(created.id)
+          }
+        }
+        if (createdIds.length > 0) {
+          setSelectedNodeId(null)
+          setSelectedEdgeId(null)
+          setSelectedGroupId(null)
+          setSelectionDraft(null)
+          setSelectedNodeIds(createdIds)
+          showNotice('info', createdIds.length === 1
+            ? '已复制节点'
+            : '已复制 ' + String(createdIds.length) + ' 个节点')
+        }
+      }, [flushDrafts, model, runAction, showNotice])
 
       const dropGroupDraft = useCallback(() => {
         setGroupDraft(null)
-        setPendingGroupIds([])
       }, [])
 
       const handleRenameGroup = useCallback((groupId) => {
@@ -7108,7 +7640,8 @@ window.__ModuleLoader__.load({
             && Array.isArray(group.nodeIds)
             && group.nodeIds.length === draft.nodeIds.length)
           if (created !== undefined) setSelectedGroupId(created.id)
-          setPendingGroupIds([])
+          setSelectedNodeIds([])
+          setSelectionDraft(null)
           showNotice('info', '已创建组合「' + name + '」')
         }
         return explainFailure(result)
@@ -7388,10 +7921,12 @@ window.__ModuleLoader__.load({
               if (id === workspaceId) return
               flushDrafts()
               setSelectedNodeId(null)
+              setSelectedNodeIds([])
+              setSelectionDraft(null)
+              setDeleteDraft(null)
               setSelectedEdgeId(null)
               setSelectedGroupId(null)
               setGroupDraft(null)
-              setPendingGroupIds([])
               setLinkDraft(null)
               setWorkspaceId(id)
             },
@@ -7410,10 +7945,11 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dsh-td-main' + (notice !== null ? ' dsh-td-main-notice' : '') },
             h(GraphCanvas, {
               model,
+              workspaceKey: workspaceId,
               selectedNodeId,
+              selectedNodeIds,
               selectedEdgeId,
               selectedGroupId,
-              pendingGroupNodeIds: pendingGroupIds,
               layoutMode,
               onToggleLayoutMode: toggleLayoutMode,
               onSelectNode: handleSelectNode,
@@ -7426,7 +7962,9 @@ window.__ModuleLoader__.load({
               onRequestLink: handleRequestLink,
               onDeleteEdge: handleDeleteEdge,
               onAutoLayout: handleAutoLayout,
-              onLasso: handleLasso,
+              onSelectMany: handleSelectMany,
+              onDuplicateNodes: handleDuplicateNodes,
+              onRequestDelete: handleRequestDelete,
               onUndo: handleUndo,
               canUndo: undoDepth > 0,
             }),
@@ -7440,6 +7978,15 @@ window.__ModuleLoader__.load({
                 onConfirm: handleConfirmLink,
                 onCancel: () => setLinkDraft(null),
                 onDone: () => setLinkDraft(null),
+              })
+              : null,
+            selectionDraft !== null
+              ? h(SelectionPanel, {
+                key: 'select:' + selectionDraft.nodeIds.join('|'),
+                count: selectionDraft.nodeIds.length,
+                onGroup: handleGroupSelection,
+                onDelete: handleDeleteSelection,
+                onClose: handleCloseSelectionPanel,
               })
               : null,
             groupDraft !== null
@@ -7457,6 +8004,18 @@ window.__ModuleLoader__.load({
                 onConfirm: handleConfirmGroup,
                 onCancel: dropGroupDraft,
                 onDone: dropGroupDraft,
+              })
+              : null,
+            deleteDraft !== null
+              ? h(DeleteNodesDialog, {
+                key: 'delete:' + deleteDraft.nodeIds.join('|'),
+                titles: deleteDraft.nodeIds.map((nodeId) => {
+                  const node = model.nodeById[nodeId]
+                  return node !== undefined ? node.title : nodeId
+                }),
+                onConfirm: handleConfirmDelete,
+                onCancel: dropDeleteDraft,
+                onDone: dropDeleteDraft,
               })
               : null,
             // Operation feedback belongs to the canvas column and floats above
@@ -7626,3 +8185,4 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
