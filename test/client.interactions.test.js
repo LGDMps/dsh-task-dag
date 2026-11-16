@@ -68,7 +68,7 @@ function node(id, title, x, y, status = 'todo') {
     agentPreset: null,
     model: null,
     reasoningEffort: null,
-    schedule: null,
+    timing: null,
     createdAt: NOW,
     updatedAt: NOW,
     completedAt: status === 'done' ? NOW : null,

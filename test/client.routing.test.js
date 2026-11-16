@@ -39,7 +39,7 @@ function fixtureState() {
     agentPreset: null,
     model: null,
     reasoningEffort: null,
-    schedule: null,
+    timing: null,
     createdAt: NOW,
     updatedAt: NOW,
     completedAt: null,

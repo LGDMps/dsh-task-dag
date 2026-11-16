@@ -5,17 +5,21 @@
  * browser half, `src/tools.js` exposes the same operations to agents,
  * `src/prompt.js` injects the node context into attached sessions,
  * `src/description.js` keeps the task description current from user messages,
- * and `src/scheduler.js` runs the per-node timed executions.
+ * and `src/timing.js` enforces each node's time window.
  *
  * `sessions` and `typertGateway` are resolved lazily inside `src/sessions.js`
  * so the graph still works in a profile that has no session gateway.
+ *
+ * There is no cron scheduler any more: wall-clock automation belongs to DSH's
+ * own scheduled tasks. The timing watcher only enforces each node's earliest
+ * start, per-run limit and absolute deadline.
  */
 import { GraphStore } from './src/store.js'
 import { registerRoutes } from './src/routes.js'
 import { registerTools } from './src/tools.js'
 import { registerPromptSection } from './src/prompt.js'
 import { startDescriptionTracker } from './src/description.js'
-import { TaskDagScheduler } from './src/scheduler.js'
+import { TaskTimingWatcher } from './src/timing.js'
 
 export const inject = ['webServer', 'workspaceRegistry', 'tools', 'systemPrompt']
 
@@ -48,9 +52,12 @@ export function apply(ctx, config) {
     // node's current session are folded into the task description even when the
     // Agent never issues graph_update_node.
     ['task description upkeep', () => startDescriptionTracker(ctx, options.store)],
-    // Constructed inside the mount so a broken scheduler is caught by the same
-    // per-surface try/catch as the other three; its disposer clears the timers.
-    ['scheduled execution', () => new TaskDagScheduler(ctx, options.store).start()],
+    // Constructed inside the mount so a broken watcher is caught by the same
+    // per-surface try/catch as the other surfaces; its disposer clears the timer.
+    ['timing window enforcement', () => {
+      const watcher = new TaskTimingWatcher(ctx, options.store).start()
+      return () => watcher.stop()
+    }],
   ]
   for (const [label, mount] of surfaces) {
     ctx.effect(() => {

@@ -42,7 +42,7 @@ function makeNode(id, extra = {}) {
     agentPreset: null,
     model: null,
     reasoningEffort: null,
-    schedule: null,
+    timing: null,
     createdAt: T0,
     updatedAt: T0,
     completedAt: null,
@@ -297,19 +297,15 @@ test('assertInvariants rejects a failed prerequisite, duplicate triples and bad 
   bothTerminal.nodes[0].completedAt = T0
   throwsCode(() => assertInvariants(bothTerminal), CODES.invariant, 'both terminal timestamps rejected')
 
-  const badSchedule = structuredClone(healthy)
-  badSchedule.nodes[0].schedule = {
-    enabled: true,
-    cron: '* * * * *',
-    nextRunAt: T0,
-    lastTriggeredAt: null,
-    lastFinishedAt: null,
-    lastResult: 'exploded',
-    lastError: null,
-    lastSkippedReason: null,
-    lastSessionId: null,
+  const badTiming = structuredClone(healthy)
+  badTiming.nodes[0].timing = {
+    startAt: null,
+    deadlineAt: null,
+    maxRunMinutes: 0,
+    lastTimeoutAt: null,
+    lastTimeoutReason: null,
   }
-  throwsCode(() => assertInvariants(badSchedule), CODES.invariant, 'unknown schedule result rejected')
+  throwsCode(() => assertInvariants(badTiming), CODES.invariant, 'invalid run limit rejected')
 })
 
 test('normalizeGraph migrates a v1 document to conditions and a milestone', () => {
@@ -372,7 +368,7 @@ test('normalizeGraph migrates a v1 document to conditions and a milestone', () =
   assert.equal(graph.nodes[0].agentPreset, null)
   assert.equal(graph.nodes[0].model, null)
   assert.equal(graph.nodes[0].reasoningEffort, null)
-  assert.equal(graph.nodes[0].schedule, null)
+  assert.equal(graph.nodes[0].timing, null)
   assert.equal(graph.nodes[0].failedAt, null)
 
   // The migration preserves the old AND semantics: B is blocked until A is done.
@@ -686,4 +682,32 @@ test('assertInvariants enforces the group invariants', () => {
   const notAnArray = base()
   notAnArray.groups = 'nope'
   throwsCode(() => assertInvariants(notAnArray), CODES.invariant, 'a non-array groups field rejected')
+})
+
+test('normalizeGraph repairs timing windows and ignores the removed schedule field', () => {
+  const raw = makeGraph([
+    makeNode('n_a', {
+      timing: {
+        startAt: T0,
+        deadlineAt: 'not-a-date',
+        maxRunMinutes: 999999,
+        lastTimeoutAt: T0,
+        lastTimeoutReason: 'made-up',
+      },
+      schedule: { enabled: true, cron: '* * * * *' },
+    }),
+    makeNode('n_b', { timing: { startAt: null, deadlineAt: null, maxRunMinutes: null } }),
+    makeNode('n_c', { timing: 'nope' }),
+  ])
+  const graph = normalizeGraph(raw)
+  assert.deepEqual(graph.nodes[0].timing, {
+    startAt: T0,
+    deadlineAt: null,
+    maxRunMinutes: 10080,
+    lastTimeoutAt: null,
+    lastTimeoutReason: null,
+  })
+  assert.equal('schedule' in graph.nodes[0], false, 'the cron field is dropped')
+  assert.equal(graph.nodes[1].timing, null, 'an empty window becomes null')
+  assert.equal(graph.nodes[2].timing, null, 'a malformed window becomes null')
 })

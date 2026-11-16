@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { GraphStore } from '../src/store.js'
-import { applyAction, applyExecutionOutcome } from '../src/ops.js'
+import { applyAction } from '../src/ops.js'
 import { derive, findNode } from '../src/model.js'
 import { TaskDagError } from '../src/errors.js'
 
@@ -537,60 +537,83 @@ test('set-milestone accepts any node and the milestone may be a prerequisite', a
 })
 
 /* ------------------------------------------------------------------ */
-/* schedule                                                            */
+/* timing window                                                       */
 /* ------------------------------------------------------------------ */
 
-test('set-schedule arms, recomputes and disarms a node schedule', async (t) => {
+test('set-timing stores the window, validates it and clears to null', async (t) => {
   const workspace = await makeWorkspace(t)
   const store = new GraphStore()
   const host = fakeHost()
   const a = await addNode(host, store, workspace, { title: 'A' })
+  const startAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+  const deadlineAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString()
 
-  let applied = await act(host, store, workspace, 'set-schedule', {
+  let applied = await act(host, store, workspace, 'set-timing', {
     nodeId: a.node.id,
-    enabled: true,
-    cron: '*/5 * * * *',
+    startAt,
+    deadlineAt,
+    maxRunMinutes: 90,
   })
-  assert.equal(applied.result.schedule.enabled, true)
-  assert.equal(applied.result.schedule.cron, '*/5 * * * *')
-  assert.ok(Date.parse(applied.result.schedule.nextRunAt) > Date.now())
-  assert.equal(applied.result.schedule.lastResult, null)
+  assert.deepEqual(applied.result.timing, {
+    startAt,
+    deadlineAt,
+    maxRunMinutes: 90,
+    lastTimeoutAt: null,
+    lastTimeoutReason: null,
+  })
 
-  applied = await act(host, store, workspace, 'set-schedule', {
-    nodeId: a.node.id,
-    cron: '0 9 * * 1-5',
-  })
-  assert.equal(applied.result.schedule.cron, '0 9 * * 1-5')
-  assert.ok(Date.parse(applied.result.schedule.nextRunAt) > Date.now())
-
-  applied = await act(host, store, workspace, 'set-schedule', {
-    nodeId: a.node.id,
-    enabled: false,
-  })
-  assert.equal(applied.result.schedule.enabled, false)
-  assert.equal(applied.result.schedule.nextRunAt, null)
+  applied = await act(host, store, workspace, 'set-timing', { nodeId: a.node.id, maxRunMinutes: 30 })
+  assert.equal(applied.result.timing.maxRunMinutes, 30)
+  assert.equal(applied.result.timing.startAt, startAt, 'partial updates keep the other fields')
 
   await assert.rejects(
-    act(host, store, workspace, 'set-schedule', {
-      nodeId: a.node.id,
-      enabled: true,
-      cron: 'not a cron',
-    }),
+    act(host, store, workspace, 'set-timing', { nodeId: a.node.id, deadlineAt: startAt }),
     (error) => codeOf(error) === 'invalid-request',
   )
   await assert.rejects(
-    act(host, store, workspace, 'set-schedule', {
-      nodeId: a.node.id,
-      enabled: true,
-      cron: '0 0 30 2 *',
-    }),
+    act(host, store, workspace, 'set-timing', { nodeId: a.node.id, maxRunMinutes: 0 }),
     (error) => codeOf(error) === 'invalid-request',
   )
-  const fresh = await addNode(host, store, workspace, { title: '没有定时表达式' })
   await assert.rejects(
-    act(host, store, workspace, 'set-schedule', { nodeId: fresh.node.id, enabled: true }),
+    act(host, store, workspace, 'set-timing', { nodeId: a.node.id, maxRunMinutes: 10081 }),
     (error) => codeOf(error) === 'invalid-request',
   )
+
+  applied = await act(host, store, workspace, 'set-timing', {
+    nodeId: a.node.id,
+    startAt: '',
+    deadlineAt: '',
+    maxRunMinutes: '',
+  })
+  assert.equal(applied.result.timing, null, 'an empty window removes the record')
+})
+
+test('a future earliest start blocks handoff and the doing status', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  const startAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+  await act(host, store, workspace, 'set-timing', { nodeId: a.node.id, startAt })
+
+  await assert.rejects(
+    act(host, store, workspace, 'handoff', { nodeId: a.node.id, mode: 'blank' }),
+    (error) => codeOf(error) === 'start-not-reached' && error.status === 409,
+  )
+  await assert.rejects(
+    act(host, store, workspace, 'update-node', { nodeId: a.node.id, status: 'doing' }),
+    (error) => codeOf(error) === 'start-not-reached' && error.status === 409,
+  )
+  const node = findNode(store.read(workspace).graph, a.node.id)
+  assert.equal(node.status, 'todo')
+  assert.equal(node.sessions.length, 0, 'a refused handoff creates no session')
+
+  await act(host, store, workspace, 'set-timing', {
+    nodeId: a.node.id,
+    startAt: new Date(Date.now() - 60 * 1000).toISOString(),
+  })
+  const applied = await act(host, store, workspace, 'handoff', { nodeId: a.node.id, mode: 'blank' })
+  assert.equal(findNode(applied.graph, a.node.id).status, 'doing')
 })
 
 /* ------------------------------------------------------------------ */
@@ -954,6 +977,56 @@ test('handoff sends a deterministic brief after committing the chain', async (t)
   assert.equal(node.sessions[1].handoff.mode, 'brief')
 })
 
+test('handoff promotes a session-less todo node to doing', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+  const a = await addNode(host, store, workspace, { title: 'A' })
+  assert.equal(a.node.status, 'todo')
+  assert.equal(a.node.sessions.length, 0)
+
+  const applied = await act(host, store, workspace, 'handoff', { nodeId: a.node.id, mode: 'blank' })
+  const node = findNode(applied.graph, a.node.id)
+  assert.equal(node.status, 'doing', 'the first handoff starts the task')
+  assert.equal(applied.result.status, 'doing')
+  assert.equal(applied.result.statusChanged, true)
+  assert.equal(node.completedAt, null)
+  assert.equal(node.failedAt, null)
+  assert.equal(node.sessions.length, 1)
+})
+
+test('handoff keeps the status of a node that already ran or is not todo', async (t) => {
+  const workspace = await makeWorkspace(t)
+  const store = new GraphStore()
+  const host = fakeHost()
+
+  const ran = await addNode(host, store, workspace, { title: 'Ran' })
+  await act(host, store, workspace, 'attach-session', { nodeId: ran.node.id, sessionId: 'session-old' })
+  const ranApplied = await act(host, store, workspace, 'handoff', { nodeId: ran.node.id, mode: 'blank' })
+  const ranNode = findNode(ranApplied.graph, ran.node.id)
+  assert.equal(ranNode.status, 'todo', 'an existing session chain means the task already started')
+  assert.equal(ranApplied.result.statusChanged, false)
+
+  const doing = await addNode(host, store, workspace, { title: 'Doing' })
+  await act(host, store, workspace, 'update-node', { nodeId: doing.node.id, status: 'doing' })
+  const doingApplied = await act(host, store, workspace, 'handoff', { nodeId: doing.node.id, mode: 'blank' })
+  assert.equal(findNode(doingApplied.graph, doing.node.id).status, 'doing')
+  assert.equal(doingApplied.result.statusChanged, false)
+
+  const planned = await addNode(host, store, workspace, { title: 'Planned' })
+  await act(host, store, workspace, 'update-node', { nodeId: planned.node.id, status: 'planned' })
+  const plannedApplied = await act(host, store, workspace, 'handoff', {
+    nodeId: planned.node.id,
+    mode: 'blank',
+  })
+  assert.equal(
+    findNode(plannedApplied.graph, planned.node.id).status,
+    'planned',
+    'only a node waiting to start is promoted',
+  )
+  assert.equal(plannedApplied.result.statusChanged, false)
+})
+
 test('archive-sessions archives the whole chain and reports failures', async (t) => {
   const workspace = await makeWorkspace(t)
   const store = new GraphStore()
@@ -975,62 +1048,6 @@ test('unarchive-session delegates to the host', async (t) => {
   const applied = await act(host, store, workspace, 'unarchive-session', { sessionId: 'session-1' })
   assert.equal(applied.result.sessionId, 'session-1')
   assert.deepEqual(host.calls.unarchived[0], { sessionId: 'session-1' })
-})
-
-/* ------------------------------------------------------------------ */
-/* execution settlement                                                */
-/* ------------------------------------------------------------------ */
-
-test('applyExecutionOutcome settles a doing node and detaches a failed one', async (t) => {
-  const workspace = await makeWorkspace(t)
-  const store = new GraphStore()
-  const host = fakeHost()
-  const a = await addNode(host, store, workspace, { title: 'A' })
-  const b = await addNode(host, store, workspace, { title: 'B', after: [a.node.id] })
-  let graph = store.read(workspace).graph
-
-  // Not doing yet: nothing applies.
-  let settled = applyExecutionOutcome(graph, { nodeId: a.node.id, outcome: 'succeeded' })
-  assert.equal(settled.result.applied, false)
-  assert.equal(settled.result.reason, 'not-doing')
-
-  await act(host, store, workspace, 'update-node', { nodeId: a.node.id, status: 'doing' })
-  await act(host, store, workspace, 'attach-session', { nodeId: a.node.id, sessionId: 'session-run' })
-  graph = store.read(workspace).graph
-
-  // A human switched the session mid-run: the result must not settle the node.
-  settled = applyExecutionOutcome(graph, {
-    nodeId: a.node.id,
-    outcome: 'succeeded',
-    sessionId: 'session-other',
-  })
-  assert.equal(settled.result.applied, false)
-  assert.equal(settled.result.reason, 'session-changed')
-
-  settled = applyExecutionOutcome(graph, {
-    nodeId: a.node.id,
-    outcome: 'succeeded',
-    sessionId: 'session-run',
-  })
-  assert.equal(settled.result.applied, true)
-  assert.equal(findNode(settled.next, a.node.id).status, 'done')
-  assert.equal(typeof findNode(settled.next, a.node.id).completedAt, 'string')
-  assert.equal(settled.event.type, 'node/execution')
-
-  // Reset to doing and fail: the failed node must not remain a prerequisite.
-  let current = structuredClone(settled.next)
-  current.nodes.find((node) => node.id === a.node.id).status = 'doing'
-  current.nodes.find((node) => node.id === a.node.id).completedAt = null
-  settled = applyExecutionOutcome(current, {
-    nodeId: a.node.id,
-    outcome: 'failed',
-    sessionId: 'session-run',
-  })
-  assert.equal(settled.result.applied, true)
-  assert.equal(findNode(settled.next, a.node.id).status, 'failed')
-  assert.equal(settled.next.edges.length, 0)
-  assert.equal(settled.result.detachedEdges[0].to, b.node.id)
-  assert.equal(findNode(settled.next, b.node.id).conditions.length, 1)
 })
 
 /* ------------------------------------------------------------------ */

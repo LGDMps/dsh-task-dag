@@ -12,7 +12,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { EventEmitter } from 'node:events'
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -22,7 +23,9 @@ import {
   API_PREFIX,
   CATALOG_CACHE_MS,
   invalidateCatalogCache,
+  openFolderInFileManager,
   registerRoutes,
+  revealCommandFor,
   snapshotFor,
 } from '../src/routes.js'
 import {
@@ -66,7 +69,7 @@ function makeNode(id, title, status = 'todo', options = {}) {
     conditions = [],
     agentPreset = null,
     model = null,
-    schedule = null,
+    timing = null,
   } = options
   return {
     id,
@@ -78,7 +81,7 @@ function makeNode(id, title, status = 'todo', options = {}) {
     position: null,
     agentPreset,
     model,
-    schedule,
+    timing,
     createdAt: CREATED,
     updatedAt: CREATED,
     completedAt: status === 'done' ? CREATED : null,
@@ -124,16 +127,12 @@ function chainGraph(root, revision = 3) {
         conditions: [makeCondition('c_bbbb0001', '需求评审通过')],
         agentPreset: 'preset-coder',
         model: 'deepseek/deepseek-chat',
-        schedule: {
-          enabled: true,
-          cron: '0 9 * * 1-5',
-          nextRunAt: '2026-10-29T01:00:00.000Z',
-          lastTriggeredAt: null,
-          lastFinishedAt: null,
-          lastResult: null,
-          lastError: null,
-          lastSkippedReason: null,
-          lastSessionId: null,
+        timing: {
+          startAt: '2026-10-29T01:00:00.000Z',
+          deadlineAt: '2026-10-29T09:00:00.000Z',
+          maxRunMinutes: 120,
+          lastTimeoutAt: null,
+          lastTimeoutReason: null,
         },
       }),
       makeNode('n_cccc3333', '写文档', 'todo', {
@@ -328,7 +327,11 @@ async function createHarness(options = {}) {
   if (options.gateway !== undefined) ctx.typertGateway = options.gateway
   if (options.llm !== undefined) ctx.llm = options.llm
 
-  const dispose = registerRoutes(ctx, { store, handoffThreshold: 0.6 })
+  const dispose = registerRoutes(ctx, {
+    store,
+    handoffThreshold: 0.6,
+    ...(typeof options.openFolder === 'function' ? { openFolder: options.openFolder } : {}),
+  })
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -421,6 +424,109 @@ test('ping answers with the plugin identity', async (t) => {
   assert.equal(body.ok, true)
   assert.equal(body.plugin, 'dsh-task-dag')
   assert.equal(body.pid, process.pid)
+})
+
+test('open-folder hands the project graph directory to the native file manager', async (t) => {
+  const opened = []
+  const harness = await createHarness({
+    openFolder: async (directory) => {
+      opened.push(directory)
+      return { path: directory, via: 'test' }
+    },
+  })
+  t.after(() => harness.close())
+
+  const response = await fetch(`${harness.base}${API_PREFIX}/open-folder`, {
+    method: 'POST',
+    headers: originHeaders(harness.base, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ workspaceId: WORKSPACE_ID }),
+  })
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.ok, true)
+  assert.equal(body.path, join(harness.root, '.dsh-task-graph'))
+  assert.deepEqual(opened, [join(harness.root, '.dsh-task-graph')])
+  await access(join(harness.root, '.dsh-task-graph'))
+})
+
+test('open-folder validates the method, body and workspace, and reports opener failures', async (t) => {
+  const harness = await createHarness({
+    openFolder: async () => {
+      throw new Error('no desktop')
+    },
+  })
+  t.after(() => harness.close())
+
+  const getResponse = await fetch(`${harness.base}${API_PREFIX}/open-folder`)
+  assert.equal(getResponse.status, 405)
+  assert.equal(getResponse.headers.get('allow'), 'POST')
+
+  const plain = await fetch(`${harness.base}${API_PREFIX}/open-folder`, {
+    method: 'POST',
+    headers: originHeaders(harness.base, { 'content-type': 'text/plain' }),
+    body: '{}',
+  })
+  assert.equal(plain.status, 415)
+
+  const noWorkspace = await fetch(`${harness.base}${API_PREFIX}/open-folder`, {
+    method: 'POST',
+    headers: originHeaders(harness.base, { 'content-type': 'application/json' }),
+    body: JSON.stringify({}),
+  })
+  assert.equal(noWorkspace.status, 400)
+  assertErrorBody(await noWorkspace.json())
+
+  const unknown = await fetch(`${harness.base}${API_PREFIX}/open-folder`, {
+    method: 'POST',
+    headers: originHeaders(harness.base, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ workspaceId: 'ws_missing' }),
+  })
+  assert.equal(unknown.status, 404)
+
+  const failed = await fetch(`${harness.base}${API_PREFIX}/open-folder`, {
+    method: 'POST',
+    headers: originHeaders(harness.base, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ workspaceId: WORKSPACE_ID }),
+  })
+  assert.equal(failed.status, 503)
+  const failedBody = await failed.json()
+  assert.equal(failedBody.ok, false)
+  assert.match(failedBody.message, /无法打开文件夹/)
+})
+
+test('the system folder opener uses the platform command and reports spawn failures', async () => {
+  assert.equal(revealCommandFor('win32'), 'explorer')
+  assert.equal(revealCommandFor('darwin'), 'open')
+  assert.equal(revealCommandFor('linux'), 'xdg-open')
+
+  const calls = []
+  const spawned = await openFolderInFileManager('C:\\演示\\任务图', {
+    platform: 'win32',
+    spawn(command, args, options) {
+      calls.push({ command, args, options })
+      const child = new EventEmitter()
+      child.unref = () => {}
+      setImmediate(() => child.emit('spawn'))
+      return child
+    },
+  })
+  assert.equal(spawned.via, 'explorer')
+  assert.deepEqual(calls[0].args, ['C:\\演示\\任务图'])
+  assert.equal(calls[0].options.detached, true)
+  assert.equal(calls[0].options.stdio, 'ignore')
+
+  await assert.rejects(
+    openFolderInFileManager('/tmp/missing', {
+      platform: 'linux',
+      spawn() {
+        const child = new EventEmitter()
+        child.unref = () => {}
+        setImmediate(() => child.emit('error', new Error('xdg-open missing')))
+        return child
+      },
+    }),
+    /xdg-open missing/,
+  )
 })
 
 test('workspaces lists v2 progress with doing/failed/planned and no completion flag', async (t) => {
@@ -837,7 +943,7 @@ test('action adds a v2 node and returns the fresh snapshot', async (t) => {
   assert.deepEqual(node.conditions, [])
   assert.equal(node.agentPreset, null)
   assert.equal(node.model, null)
-  assert.equal(node.schedule, null)
+  assert.equal(node.timing, null)
   assert.equal(body.snapshot.graph.revision, 1)
   assert.deepEqual(body.snapshot.derived.ready, [node.id])
 
@@ -935,7 +1041,7 @@ test('action supports add-node conditions/after, link by condition title, and co
   assert.ok(!deleted.graph.edges.some((edge) => edge.conditionId === 'c_cccc0001'))
 })
 
-test('action enforces failed-node rules and supports milestone and schedule', async (t) => {
+test('action enforces failed-node rules and supports milestone and timing', async (t) => {
   const harness = await createHarness()
   t.after(() => harness.close())
   await harness.writeGraph(chainGraph(harness.root))
@@ -1003,30 +1109,50 @@ test('action enforces failed-node rules and supports milestone and schedule', as
   const alias = await post('set-closeout', { nodeId: 'n_eeee5555' })
   assert.equal(alias.graph.milestoneNodeId, 'n_eeee5555')
 
-  // Per-node schedule.
-  const scheduled = await post('set-schedule', {
+  // Per-node timing window.
+  const startAt = '2026-11-12T01:00:00.000Z'
+  const deadlineAt = '2026-11-12T09:00:00.000Z'
+  const timed = await post('set-timing', {
     nodeId: 'n_cccc3333',
-    enabled: true,
-    cron: '0 9 * * 1-5',
+    startAt,
+    deadlineAt,
+    maxRunMinutes: 120,
   })
-  const scheduledNode = scheduled.graph.nodes.find((node) => node.id === 'n_cccc3333')
-  assert.equal(scheduledNode.schedule.enabled, true)
-  assert.equal(scheduledNode.schedule.cron, '0 9 * * 1-5')
-  assert.equal(typeof scheduledNode.schedule.nextRunAt, 'string')
+  const timedNode = timed.graph.nodes.find((node) => node.id === 'n_cccc3333')
+  assert.deepEqual(timedNode.timing, {
+    startAt,
+    deadlineAt,
+    maxRunMinutes: 120,
+    lastTimeoutAt: null,
+    lastTimeoutReason: null,
+  })
 
-  const disabled = await post('set-schedule', { nodeId: 'n_cccc3333', enabled: false })
-  const disabledNode = disabled.graph.nodes.find((node) => node.id === 'n_cccc3333')
-  assert.equal(disabledNode.schedule.enabled, false)
-  assert.equal(disabledNode.schedule.nextRunAt, null)
+  const clearedTiming = await post('set-timing', {
+    nodeId: 'n_cccc3333',
+    startAt: '',
+    deadlineAt: '',
+    maxRunMinutes: '',
+  })
+  const clearedNode = clearedTiming.graph.nodes.find((node) => node.id === 'n_cccc3333')
+  assert.equal(clearedNode.timing, null)
 
-  const badCron = await harness.postAction({
+  const badTiming = await harness.postAction({
     workspaceId: WORKSPACE_ID,
-    action: 'set-schedule',
+    action: 'set-timing',
     expectedRevision: revision,
-    payload: { nodeId: 'n_cccc3333', enabled: true, cron: 'not a cron' },
+    payload: { nodeId: 'n_cccc3333', maxRunMinutes: 0 },
   })
-  assert.equal(badCron.response.status, 400)
-  assertErrorBody(badCron.body)
+  assert.equal(badTiming.response.status, 400)
+  assertErrorBody(badTiming.body)
+
+  const tooLate = await harness.postAction({
+    workspaceId: WORKSPACE_ID,
+    action: 'set-timing',
+    expectedRevision: revision,
+    payload: { nodeId: 'n_cccc3333', startAt: deadlineAt, deadlineAt: startAt },
+  })
+  assert.equal(tooLate.response.status, 400)
+  assertErrorBody(tooLate.body)
 })
 
 test('action creates, renames and deletes groups and snapshots carry them', async (t) => {
@@ -1386,12 +1512,12 @@ test('graph_map exposes conditions, execution settings and the milestone', async
   }])
   assert.equal(interfaceNode.agentPreset, 'preset-coder')
   assert.equal(interfaceNode.model, 'deepseek/deepseek-chat')
-  assert.deepEqual(interfaceNode.schedule, {
-    enabled: true,
-    cron: '0 9 * * 1-5',
-    nextRunAt: '2026-10-29T01:00:00.000Z',
-    lastResult: null,
-    lastError: null,
+  assert.deepEqual(interfaceNode.timing, {
+    startAt: '2026-10-29T01:00:00.000Z',
+    deadlineAt: '2026-10-29T09:00:00.000Z',
+    maxRunMinutes: 120,
+    lastTimeoutAt: null,
+    lastTimeoutReason: null,
   })
 
   assert.deepEqual(map.ready, [{ id: 'n_bbbb2222', title: '实现接口' }])

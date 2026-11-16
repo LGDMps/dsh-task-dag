@@ -38,7 +38,7 @@ function makeNode(id, extra = {}) {
     agentPreset: null,
     model: null,
     reasoningEffort: null,
-    schedule: null,
+    timing: null,
     createdAt: T0,
     updatedAt: T0,
     completedAt: null,
@@ -149,16 +149,12 @@ test('the document round-trips sessions, milestone and manual positions', async 
     agentPreset: 'build',
     model: 'deepseek/deepseek-chat',
     reasoningEffort: 'high',
-    schedule: {
-      enabled: true,
-      cron: '0 9 * * 1-5',
-      nextRunAt: T0,
-      lastTriggeredAt: null,
-      lastFinishedAt: null,
-      lastResult: null,
-      lastError: null,
-      lastSkippedReason: null,
-      lastSessionId: null,
+    timing: {
+      startAt: null,
+      deadlineAt: T0,
+      maxRunMinutes: 90,
+      lastTimeoutAt: null,
+      lastTimeoutReason: null,
     },
   })
 
@@ -181,7 +177,7 @@ test('the document round-trips sessions, milestone and manual positions', async 
   assert.equal(persisted.nodes[1].agentPreset, 'build')
   assert.equal(persisted.nodes[1].model, 'deepseek/deepseek-chat')
   assert.equal(persisted.nodes[1].reasoningEffort, 'high')
-  assert.equal(persisted.nodes[1].schedule.cron, '0 9 * * 1-5')
+  assert.equal(persisted.nodes[1].timing.maxRunMinutes, 90)
 })
 
 test('a stale expectedRevision is rejected with a 409 conflict', async (t) => {

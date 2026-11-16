@@ -28,18 +28,20 @@ const clientSource = readFileSync(join(here, '..', 'client.js'), 'utf8')
 const WORKSPACE_ID = 'ws_render'
 const NOW = '2026-10-30T12:00:00.000Z'
 
-/** A v2 graph: five statuses, conditions, a milestone, a schedule. */
-function fixtureState() {
+/** A v2 graph: five statuses, conditions, a milestone, a timing window. */
+function fixtureState(options = {}) {
   const nodes = [
     {
       id: 'n_alpha', title: '确定数据模型', status: 'done',
       notes: '**字段**已经定稿\n\n- 约束一\n- 约束二',
       conditions: [{ id: 'c_alpha', title: '需求评审通过', createdAt: NOW }],
       agentPreset: 'preset_a', model: 'prov_a/model_a',
-      schedule: {
-        enabled: true, cron: '0 9 * * 1-5', nextRunAt: '2026-11-02T01:00:00.000Z',
-        lastTriggeredAt: '2026-10-30T01:00:00.000Z', lastFinishedAt: '2026-10-30T01:05:00.000Z',
-        lastResult: 'succeeded', lastError: null, lastSkippedReason: null, lastSessionId: 'scheduled-1',
+      timing: {
+        startAt: '2026-11-02T01:00:00.000Z',
+        deadlineAt: '2026-11-02T09:00:00.000Z',
+        maxRunMinutes: 90,
+        lastTimeoutAt: null,
+        lastTimeoutReason: null,
       },
       sessions: [
         {
@@ -59,34 +61,34 @@ function fixtureState() {
         { id: 'c_beta_1', title: '接口评审通过', createdAt: NOW },
         { id: 'c_beta_2', title: '数据模型定稿', createdAt: NOW },
       ],
-      agentPreset: null, model: null, schedule: null,
+      agentPreset: null, model: null, timing: null,
       sessions: [], position: { x: 320, y: 40 }, createdAt: NOW, updatedAt: NOW,
       completedAt: null, failedAt: null,
     },
     {
       id: 'n_gamma', title: '接入前端', status: 'doing', notes: '',
       conditions: [{ id: 'c_gamma', title: '接口联调通过', createdAt: NOW }],
-      agentPreset: null, model: null, schedule: null,
+      agentPreset: null, model: null, timing: null,
       sessions: [], position: { x: 600, y: 40 }, createdAt: NOW, updatedAt: NOW,
       completedAt: null, failedAt: null,
     },
     {
       id: 'n_delta', title: '性能压测', status: 'planned', notes: '',
-      conditions: [], agentPreset: null, model: null, schedule: null,
+      conditions: [], agentPreset: null, model: null, timing: null,
       sessions: [], position: { x: 40, y: 180 }, createdAt: NOW, updatedAt: NOW,
       completedAt: null, failedAt: null,
     },
     {
       id: 'n_epsilon', title: '旧版兼容', status: 'failed', notes: '',
       conditions: [{ id: 'c_epsilon', title: '兼容测试通过', createdAt: NOW }],
-      agentPreset: null, model: null, schedule: null,
+      agentPreset: null, model: null, timing: null,
       sessions: [], position: { x: 320, y: 180 }, createdAt: NOW, updatedAt: NOW,
       completedAt: null, failedAt: NOW,
     },
     {
       id: 'n_zeta', title: '项目发布', status: 'todo', notes: '',
       conditions: [{ id: 'c_zeta', title: '发布检查', createdAt: NOW }],
-      agentPreset: null, model: null, schedule: null,
+      agentPreset: null, model: null, timing: null,
       sessions: [], position: { x: 600, y: 180 }, createdAt: NOW, updatedAt: NOW,
       completedAt: null, failedAt: null,
     },
@@ -101,6 +103,17 @@ function fixtureState() {
     // synthesise a "<source> 完成" condition locally.
     { id: 'e_6', from: 'n_delta', to: 'n_alpha' },
   ]
+  // The board scenario: make the blocked todo node come first in graph order,
+  // so the readiness sort is observable instead of accidentally passing.
+  if (options.blockedTodoFirst === true) {
+    const betaAt = nodes.findIndex((node) => node.id === 'n_beta')
+    const zetaAt = nodes.findIndex((node) => node.id === 'n_zeta')
+    if (betaAt >= 0 && zetaAt >= 0) {
+      const swap = nodes[betaAt]
+      nodes[betaAt] = nodes[zetaAt]
+      nodes[zetaAt] = swap
+    }
+  }
   return {
     ok: true,
     snapshot: {
@@ -343,19 +356,27 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
   const saved = new Map(globalKeys.map((key) => [key, globalThis[key]]))
 
   let actionDelayMs = 0
+  let failStateNext = false
+  let blockedTodoFirst = false
   const restub = async (url, init) => {
     const target = String(url)
     requests.push({ url: target, method: init?.method ?? 'GET', body: init?.body })
     if (target.includes('/action') && actionDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, actionDelayMs))
     }
-    const body = target.includes('/workspaces')
-      ? WORKSPACES_FIXTURE
-      : target.includes('/catalog')
-        ? CATALOG_FIXTURE
-        : target.includes('/state')
-          ? fixtureState()
-          : { ok: true }
+    let body
+    if (target.includes('/state') && failStateNext) {
+      failStateNext = false
+      body = { ok: false, code: 'host-unavailable', message: '模拟加载失败' }
+    } else {
+      body = target.includes('/workspaces')
+        ? WORKSPACES_FIXTURE
+        : target.includes('/catalog')
+          ? CATALOG_FIXTURE
+          : target.includes('/state')
+            ? fixtureState({ blockedTodoFirst })
+            : { ok: true }
+    }
     return {
       ok: true,
       status: 200,
@@ -507,12 +528,29 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
   }
   assert.ok(container.querySelector('g.dsh-td-node-failed'), 'failed nodes get their own visual class')
 
-  // Node cards show condition progress, a schedule marker and a milestone flag.
+  // Node cards show condition progress, a timing marker and a milestone flag.
   assert.match(text, /条件 2\/2/, 'satisfied condition progress renders on the target card')
   assert.match(text, /条件 0\/2/, 'an unsatisfied condition shows 0/2 on the source card')
-  assert.ok(text.includes('⏱'), 'a scheduled node shows the timer marker')
+  assert.ok(text.includes('⏱'), 'a node with a timing window shows the timer marker')
   assert.ok(text.includes('里程碑'), 'the milestone node is flagged')
   assert.match(text, /里程碑：项目发布/, 'the header names the project milestone')
+
+  // -- header controls: open the source folder and switch the middle view ---
+  const headerButton = (label) => [...container.querySelectorAll('.dsh-td-header button')]
+    .find((button) => (button.textContent ?? '') === label)
+  const openSource = headerButton('打开源文件')
+  assert.ok(openSource, 'the header offers an open-source-folder action')
+  await act(async () => {
+    openSource.click()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  const openRequest = requests.filter((item) => item.url.includes('/api/task-dag/open-folder')).at(-1)
+  assert.ok(openRequest, 'the open action posts to the Host folder route')
+  assert.equal(openRequest.method, 'POST')
+  assert.deepEqual(JSON.parse(openRequest.body), { workspaceId: WORKSPACE_ID })
+  assert.match(container.textContent ?? '', /已打开源文件夹/, 'the action reports its result')
+  const viewSwitch = headerButton('切换看板视图')
+  assert.ok(viewSwitch, 'the graph/board switch sits beside the progress summary')
 
   // The injected stylesheet carries the DSH font scale and the floating notice.
   const styleTag = window.document.querySelector('style[data-plugin-css="dsh-task-dag"]')
@@ -683,21 +721,39 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
     'choosing an effort posts the model and the effort',
   )
 
-  const scheduleHead = collapseHead('定时执行')
-  assert.ok(scheduleHead, 'the schedule section renders')
-  assert.equal(scheduleHead.getAttribute('aria-expanded'), 'false', 'schedule starts collapsed')
+  const timingHead = collapseHead('时间控制')
+  assert.ok(timingHead, 'the timing section renders')
+  assert.equal(timingHead.getAttribute('aria-expanded'), 'false', 'timing starts collapsed')
+  assert.equal(collapseHead('定时执行'), undefined, 'the old cron section is gone')
   await act(async () => {
-    scheduleHead.click()
+    timingHead.click()
     await new Promise((resolve) => setTimeout(resolve, 10))
   })
-  const scheduleText = container.textContent ?? ''
-  assert.match(scheduleText, /下次执行/, 'the next run time is shown')
-  assert.match(scheduleText, /上次结果/, 'the last result is shown')
-  assert.ok(scheduleText.includes('成功'), 'the last result is translated')
-  assert.ok(scheduleText.includes('工作日 9:00'), 'cron presets are offered')
-  const cronInput = [...container.querySelectorAll('input')]
-    .find((input) => input.value === '0 9 * * 1-5')
-  assert.ok(cronInput, 'the stored cron expression is shown in its input')
+  const timingText = container.textContent ?? ''
+  assert.match(timingText, /最早开始/, 'the earliest start field is shown')
+  assert.match(timingText, /单次最长执行（分钟）/, 'the per-run limit field is shown')
+  assert.match(timingText, /最晚结束/, 'the absolute deadline field is shown')
+  assert.match(timingText, /DSH 自带的自动化任务/, 'the section points wall-clock automation at DSH')
+  const dateInputs = [...container.querySelectorAll('input[type="datetime-local"]')]
+  assert.equal(dateInputs.length, 2, 'start and deadline use datetime-local inputs')
+  assert.ok(dateInputs.every((input) => input.value !== ''), 'the stored window fills both date fields')
+  const maxRunInput = [...container.querySelectorAll('input[type="number"]')]
+    .find((input) => input.value === '90')
+  assert.ok(maxRunInput, 'the stored run limit is shown in its input')
+  const saveTimingButton = [...container.querySelectorAll('button')]
+    .find((button) => (button.textContent ?? '') === '保存时间设置')
+  assert.ok(saveTimingButton, 'the timing section has its save action')
+  await act(async () => {
+    saveTimingButton.click()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  const timingBodies = actionBodies().filter((body) => body.action === 'set-timing')
+  assert.deepEqual(timingBodies.at(-1)?.payload, {
+    nodeId: 'n_alpha',
+    startAt: '2026-11-02T01:00:00.000Z',
+    deadlineAt: '2026-11-02T09:00:00.000Z',
+    maxRunMinutes: 90,
+  }, 'saving posts the complete window')
   assert.ok((container.textContent ?? '').includes('设为项目里程碑'), 'the milestone setting renders')
   assert.equal(
     (container.textContent ?? '').includes('完成后视为项目达成'),
@@ -837,6 +893,25 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
   assert.ok(notesEditor, 'the notes editor renders its textarea')
   assert.equal(notesEditor.value, '**字段**已经定稿\n\n- 约束一\n- 约束二')
   assert.equal(notesEditor.style.height, '150px', 'the notes editor starts at the persisted default height')
+
+  // A Tab inside the description is a tab character, not a focus move.
+  notesEditor.attachEvent = () => {}
+  notesEditor.detachEvent = () => {}
+  notesEditor.focus()
+  const notesEnd = notesEditor.value.length
+  notesEditor.setSelectionRange(notesEnd, notesEnd)
+  const tabEvent = new window.KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+  await act(async () => {
+    notesEditor.dispatchEvent(tabEvent)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  assert.equal(tabEvent.defaultPrevented, true, 'the description intercepts Tab before focus moves')
+  assert.ok(notesEditor.value.endsWith('\t'), 'Tab inserts a literal tab into the description')
+  // Let the debounced autosave for that edit settle before the next section
+  // counts action requests.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 800))
+  })
   assert.equal(
     container.querySelectorAll('.dsh-td-notes-tools button').length,
     6,
@@ -1121,6 +1196,55 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
   })
   actionDelayMs = 0
 
+  // -- task board: five status columns over the same graph ------------------
+  const boardSwitch = headerButton('切换看板视图')
+  assert.ok(boardSwitch, 'the board switch is available while the graph is shown')
+  await act(async () => {
+    boardSwitch.click()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  assert.ok(container.querySelector('.dsh-td-board'), 'the middle column renders the board')
+  assert.equal(container.querySelector('.dsh-td-canvas'), null, 'the SVG canvas is replaced, not stacked')
+  assert.deepEqual(
+    [...container.querySelectorAll('.dsh-td-board-title')].map((title) => title.textContent),
+    ['待规划', '待开始', '进行中', '已完成', '已失败'],
+    'the board has one column per node status',
+  )
+  assert.equal(
+    container.querySelectorAll('.dsh-td-board-card').length,
+    6,
+    'every node appears as one board card',
+  )
+  assert.equal(JSON.parse(window.localStorage.getItem('dsh.task-dag')).viewMode, 'board')
+
+  const boardCard = (title) => [...container.querySelectorAll('.dsh-td-board-card')]
+    .find((card) => card.querySelector('.dsh-td-board-card-title')?.textContent === title)
+  const betaCard = boardCard('写接口层')
+  assert.ok(betaCard, 'todo nodes render in the 待开始 column')
+  await act(async () => {
+    betaCard.click()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  assert.match(
+    container.querySelector('.dsh-td-detail-title')?.textContent ?? '',
+    /写接口层/,
+    'clicking a board card opens the same node detail drawer',
+  )
+  assert.ok(
+    boardCard('写接口层')?.classList.contains('dsh-td-board-card-on'),
+    'the selected card is highlighted',
+  )
+
+  const graphSwitch = headerButton('切换图谱视图')
+  assert.ok(graphSwitch, 'the switch flips its label in board view')
+  await act(async () => {
+    graphSwitch.click()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  })
+  assert.ok(container.querySelector('.dsh-td-canvas'), 'switching back restores the editable canvas')
+  assert.equal(container.querySelector('.dsh-td-board'), null)
+  assert.equal(JSON.parse(window.localStorage.getItem('dsh.task-dag')).viewMode, 'graph')
+
   // The sidebar icon must render an SVG for both presentation states.
   const iconHost = window.document.createElement('div')
   const iconRoot = createRoot(iconHost)
@@ -1138,5 +1262,74 @@ test('the browser half renders the v2 five-status graph in jsdom', async (t) => 
 
   await act(async () => {
     root.unmount()
+  })
+
+  // Remounting the panel while the persisted view is the board must load the
+  // graph exactly like the graph view does: the view choice is presentation,
+  // never a precondition for fetching state.
+  window.localStorage.setItem('dsh.task-dag', JSON.stringify({
+    workspaceId: WORKSPACE_ID,
+    viewMode: 'board',
+  }))
+  // Put the blocked todo card before the ready one in graph order; the board
+  // must still show ready cards above blocked cards in the 待开始 column.
+  blockedTodoFirst = true
+  const boardMountRequests = requests.length
+  const boardRoot = createRoot(container)
+  await act(async () => {
+    boardRoot.render(React.createElement(registered.main.component, {}))
+  })
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+  assert.ok(
+    requests.slice(boardMountRequests).some((item) => item.url.includes('/api/task-dag/state')),
+    'a panel opened directly in the board view still fetches the graph',
+  )
+  assert.equal(
+    container.querySelectorAll('.dsh-td-board-card').length,
+    6,
+    'the board renders the loaded nodes without a detour through the graph view',
+  )
+  const todoColumn = [...container.querySelectorAll('.dsh-td-board-column')]
+    .find((column) => column.getAttribute('data-status') === 'todo')
+  assert.ok(todoColumn, 'the 待开始 column renders')
+  assert.deepEqual(
+    [...todoColumn.querySelectorAll('.dsh-td-board-card-title')].map((title) => title.textContent),
+    ['写接口层', '项目发布'],
+    'ready todo cards are listed above blocked ones',
+  )
+  await act(async () => {
+    boardRoot.unmount()
+  })
+
+  // A failed first load while the board is the restored view must stay visible
+  // and offer the same retry as the graph view, instead of an empty-looking
+  // board with no explanation.
+  failStateNext = true
+  const failedBoardRoot = createRoot(container)
+  await act(async () => {
+    failedBoardRoot.render(React.createElement(registered.main.component, {}))
+  })
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+  assert.ok(container.querySelector('.dsh-td-overlay'), 'the board keeps the shared loading/error overlay')
+  assert.match(container.textContent ?? '', /图谱加载失败/, 'the board reports a failed load')
+  assert.match(container.textContent ?? '', /模拟加载失败/)
+  const retryButton = [...container.querySelectorAll('.dsh-td-overlay button')]
+    .find((button) => (button.textContent ?? '') === '重试')
+  assert.ok(retryButton, 'the board offers the same retry action')
+  await act(async () => {
+    retryButton.click()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+  })
+  assert.equal(
+    container.querySelectorAll('.dsh-td-board-card').length,
+    6,
+    'retrying from the board loads the graph without switching views',
+  )
+  await act(async () => {
+    failedBoardRoot.unmount()
   })
 })

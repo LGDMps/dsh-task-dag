@@ -19,12 +19,18 @@ import { applyAction } from './ops.js'
 // Namespace import: the catalog helpers are optional in a host without a session
 // gateway, so a missing export must degrade to an empty catalog, never a 500.
 import * as sessionApi from './sessions.js'
+import { spawn } from 'node:child_process'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 /** Every route lives under this prefix. */
 export const API_PREFIX = '/api/task-dag'
 
 /** Largest accepted POST /action body. */
 export const MAX_ACTION_BODY_BYTES = 256 * 1024
+
+/** Largest accepted POST /open-folder body. */
+export const MAX_OPEN_FOLDER_BODY_BYTES = 16 * 1024
 
 /** SSE keep-alive cadence. */
 export const SSE_HEARTBEAT_MS = 15_000
@@ -571,6 +577,42 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/** The native file manager command for a platform. */
+export function revealCommandFor(platform) {
+  if (platform === 'win32') return 'explorer'
+  if (platform === 'darwin') return 'open'
+  return 'xdg-open'
+}
+
+/**
+ * Hand one directory to the user's native file manager. Fire-and-await: the
+ * promise settles on the child's `spawn` event, so a missing command is
+ * reported instead of a silent no-op. `spawnImpl`/`platform` are injection
+ * points for tests.
+ */
+export async function openFolderInFileManager(directory, options = {}) {
+  const spawnImpl = typeof options.spawn === 'function' ? options.spawn : spawn
+  const command = revealCommandFor(options.platform ?? process.platform)
+  return new Promise((resolve, reject) => {
+    let child
+    try {
+      child = spawnImpl(command, [directory], { detached: true, stdio: 'ignore', windowsHide: true })
+    } catch (error) {
+      reject(error)
+      return
+    }
+    let settled = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      callback(value)
+    }
+    child.once('error', (error) => settle(reject, error))
+    child.once('spawn', () => settle(resolve, { path: directory, via: command }))
+    if (typeof child.unref === 'function') child.unref()
+  })
+}
+
 // ---------------------------------------------------------------------------
 // route handlers
 // ---------------------------------------------------------------------------
@@ -598,6 +640,67 @@ async function handleCatalog(ctx, req, res) {
   if (!requireMethod(req, res, 'GET')) return
   const catalog = await loadCatalog(ctx)
   writeJson(res, 200, { ok: true, catalog })
+}
+
+/**
+ * POST /open-folder — hand the project's graph directory to the native file
+ * manager. The caller names a workspace, never a path: the only directory this
+ * route can open is the graph folder the Host itself reads and writes.
+ */
+async function handleOpenFolder(ctx, store, req, res, openFolder) {
+  if (!requireMethod(req, res, 'POST')) return
+
+  const contentType = headerValue(req?.headers?.['content-type']).toLowerCase()
+  if (!contentType.startsWith('application/json')) {
+    writeJson(res, 415, {
+      ok: false,
+      code: CODES.invalidRequest,
+      message: '请用 JSON 提交打开的目录。',
+    })
+    return
+  }
+
+  const text = await readBody(req, MAX_OPEN_FOLDER_BODY_BYTES)
+  let body
+  try {
+    body = JSON.parse(text)
+  } catch {
+    writeJson(res, 400, {
+      ok: false,
+      code: CODES.invalidRequest,
+      message: '请求体不是有效的 JSON。',
+    })
+    return
+  }
+  if (!isPlainObject(body)) throw invalidBody('请求体必须是一个 JSON 对象。')
+
+  const workspaceId = typeof body.workspaceId === 'string' ? body.workspaceId.trim() : ''
+  if (workspaceId === '') throw invalidBody('缺少 workspaceId。')
+
+  const workspace = getWorkspace(ctx, workspaceId)
+  const directory = dirname(store.pathFor(workspace))
+  try {
+    mkdirSync(directory, { recursive: true })
+  } catch (error) {
+    throw new TaskDagError(CODES.hostUnavailable, `无法创建源文件夹：${error.message}`, {
+      status: 503,
+      details: { path: directory },
+    })
+  }
+
+  try {
+    await openFolder(directory)
+  } catch (error) {
+    const detail = error instanceof Error && typeof error.message === 'string' && error.message !== ''
+      ? error.message
+      : String(error)
+    throw new TaskDagError(CODES.hostUnavailable, `无法打开文件夹 ${directory}：${detail}`, {
+      status: 503,
+      details: { path: directory },
+    })
+  }
+
+  writeJson(res, 200, { ok: true, path: directory })
 }
 
 async function handleAction(ctx, store, req, res) {
@@ -810,6 +913,13 @@ export function registerRoutes(ctx, options = {}) {
     ['/catalog', (req, res) => handleCatalog(ctx, req, res)],
     ['/state', (req, res) => handleState(ctx, store, req, res)],
     ['/action', (req, res) => handleAction(ctx, store, req, res)],
+    ['/open-folder', (req, res) => handleOpenFolder(
+      ctx,
+      store,
+      req,
+      res,
+      typeof options?.openFolder === 'function' ? options.openFolder : openFolderInFileManager,
+    )],
     ['/events', (req, res) => handleEvents(ctx, store, req, res)],
   ]
 

@@ -5,15 +5,13 @@
  * then drive it over a real loopback HTTP server exactly as the browser half
  * does. They are not unit tests: every assertion is about the observable
  * contract described in the README — five statuses, condition-based
- * prerequisites, failed-node rules, per-node Agent preset/model, per-node
- * scheduling, the project milestone, deletion splicing, CAS/SSE, and the Agent
+ * prerequisites, failed-node rules, per-node Agent preset/model, per-node timing
+ * windows, the project milestone, deletion splicing, CAS/SSE, and the Agent
  * tools sharing the same graph as HTTP.
  *
- * Three scenarios:
+ * Two scenarios:
  *   1. a clean workspace driven through the whole HTTP + tool surface;
- *   2. a v1 `graph.json` seeded on disk and migrated on first read;
- *   3. a real `TaskDagScheduler` + real `GraphStore` on a due graph (launch
- *      order, skip rules, `turn/end` settlement).
+ *   2. a v1 `graph.json` seeded on disk and migrated on first read.
  *
  * Run: node test/acceptance.integration.test.js
  */
@@ -26,12 +24,10 @@ import { join } from 'node:path'
 
 import { apply } from '../index.js'
 import { GraphStore } from '../src/store.js'
-import { TaskDagScheduler } from '../src/scheduler.js'
 import { TOOL_NAMES } from '../src/tools.js'
 
 const WORKSPACE_ID = 'ws_acceptance'
 const MIGRATION_WORKSPACE_ID = 'ws_migration'
-const SCHEDULER_WORKSPACE_ID = 'ws_scheduler'
 const API = '/api/task-dag'
 const CREATED = '2026-10-28T11:00:00.000Z'
 
@@ -42,7 +38,7 @@ const CREATED = '2026-10-28T11:00:00.000Z'
 /**
  * A fake `typertGateway` covering every namespace the plugin touches.
  *
- * `states` is the live session list the gateway reports (the scheduler and the
+ * `states` is the live session list the gateway reports (the timing watcher and the
  * snapshot both read it); `events` is the per-session event list served through
  * `session/follow`; `onPrompt` runs with the graph state at prompt time, which
  * is how the acceptance test proves "attach before prompt".
@@ -762,46 +758,52 @@ test('v2 acceptance: HTTP + tools + prompt on a clean workspace', async (t) => {
     assert.deepEqual(modelCatalogCall.args, { request: {} })
   })
 
-  await t.test('set-schedule computes nextRunAt and refuses an invalid cron', async () => {
+  await t.test('set-timing stores an absolute start, a run limit and a deadline', async () => {
     const snapshot = await snapshotOf(env)
     const handoffNode = nodeByTitle(snapshot.graph, '交接任务')
+    const startAt = new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    const deadlineAt = new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString()
 
-    let updated = await act(env, 'set-schedule', {
+    let updated = await act(env, 'set-timing', {
       nodeId: handoffNode.id,
-      enabled: true,
-      cron: '0 9 * * 1-5',
+      startAt,
+      deadlineAt,
+      maxRunMinutes: 120,
     })
-    let schedule = nodeById(updated.graph, handoffNode.id).schedule
-    assert.equal(schedule.enabled, true)
-    assert.equal(schedule.cron, '0 9 * * 1-5')
-    assert.equal(typeof schedule.nextRunAt, 'string')
-    const nextRunAtMs = Date.parse(schedule.nextRunAt)
-    assert.ok(Number.isFinite(nextRunAtMs))
-    assert.ok(nextRunAtMs > Date.now() - 60_000, 'nextRunAt is a future occurrence')
-    assert.equal(schedule.lastResult, null)
-
-    // HTTP may not write nextRunAt; the server recalculates it.
-    updated = await act(env, 'set-schedule', {
-      nodeId: handoffNode.id,
-      enabled: true,
-      cron: '*/30 * * * *',
-      nextRunAt: '2000-01-01T00:00:00.000Z',
+    let timing = nodeById(updated.graph, handoffNode.id).timing
+    assert.deepEqual(timing, {
+      startAt,
+      deadlineAt,
+      maxRunMinutes: 120,
+      lastTimeoutAt: null,
+      lastTimeoutReason: null,
     })
-    schedule = nodeById(updated.graph, handoffNode.id).schedule
-    assert.notEqual(schedule.nextRunAt, '2000-01-01T00:00:00.000Z')
-    assert.ok(Date.parse(schedule.nextRunAt) > Date.now() - 60_000)
 
-    updated = await act(env, 'set-schedule', { nodeId: handoffNode.id, enabled: false })
-    schedule = nodeById(updated.graph, handoffNode.id).schedule
-    assert.equal(schedule.enabled, false)
-    assert.equal(schedule.nextRunAt, null)
+    updated = await act(env, 'set-timing', { nodeId: handoffNode.id, maxRunMinutes: 30 })
+    timing = nodeById(updated.graph, handoffNode.id).timing
+    assert.equal(timing.maxRunMinutes, 30)
+    assert.equal(timing.startAt, startAt, 'partial updates keep the other fields')
 
-    const badCron = await actExpectFailure(env, 'set-schedule', {
+    const badTiming = await actExpectFailure(env, 'set-timing', {
       nodeId: handoffNode.id,
-      enabled: true,
-      cron: 'not a cron',
+      maxRunMinutes: 0,
     }, 400)
-    assert.match(badCron.body.message, /定时表达式/)
+    assert.match(badTiming.body.message, /最长执行时长/)
+
+    const badOrder = await actExpectFailure(env, 'set-timing', {
+      nodeId: handoffNode.id,
+      startAt: deadlineAt,
+      deadlineAt: startAt,
+    }, 400)
+    assert.match(badOrder.body.message, /最晚结束时间/)
+
+    updated = await act(env, 'set-timing', {
+      nodeId: handoffNode.id,
+      startAt: '',
+      deadlineAt: '',
+      maxRunMinutes: '',
+    })
+    assert.equal(nodeById(updated.graph, handoffNode.id).timing, null)
   })
 
   await t.test('delete-node splice rewires and unlink reports orphaned conditions', async () => {
@@ -950,7 +952,7 @@ test('v2 acceptance: HTTP + tools + prompt on a clean workspace', async (t) => {
     assert.deepEqual(mappedNode.conditions.map((item) => item.title), ['工具条件', '工具新增条件'])
     assert.equal(mappedNode.agentPreset, 'preset-writer')
     assert.equal(mappedNode.model, 'deepseek/deepseek-chat')
-    assert.equal(mappedNode.schedule, null)
+    assert.equal(mappedNode.timing, null)
     // The unlinked condition keeps the node blocked; the linked one is satisfied.
     const blocked = map.blocked.find((node) => node.id === added.nodeId)
     assert.ok(blocked !== undefined, JSON.stringify(map.blocked))
@@ -1100,7 +1102,7 @@ test('v2 acceptance: a v1 graph.json is migrated to schemaVersion 2', async (t) 
     assert.ok(Array.isArray(node.conditions))
     assert.equal(node.agentPreset, null)
     assert.equal(node.model, null)
-    assert.equal(node.schedule, null)
+    assert.equal(node.timing, null)
     assert.equal(node.failedAt, null)
   }
 
@@ -1146,252 +1148,4 @@ test('v2 acceptance: a v1 graph.json is migrated to schemaVersion 2', async (t) 
   const updated = await act(env, 'update-node', { nodeId: 'n_b', status: 'doing' })
   assert.equal(updated.graph.schemaVersion, 2)
   assert.equal(nodeById(updated.graph, 'n_b').status, 'doing')
-})
-
-/* ================================================================== */
-/* 3. per-node scheduler: due graph -> launch -> settlement            */
-/* ================================================================== */
-
-const SCHEDULER_NOW = new Date(2026, 9, 29, 8, 0, 0, 0).getTime()
-
-function scheduleFixtureNode(overrides = {}) {
-  return {
-    id: 'n_x',
-    title: '任务',
-    status: 'todo',
-    notes: '',
-    conditions: [],
-    sessions: [],
-    position: null,
-    agentPreset: null,
-    model: null,
-    schedule: {
-      enabled: true,
-      cron: '0 9 * * *',
-      nextRunAt: '2000-01-01T00:00:00.000Z',
-      lastTriggeredAt: null,
-      lastFinishedAt: null,
-      lastResult: null,
-      lastError: null,
-      lastSkippedReason: null,
-      lastSessionId: null,
-    },
-    createdAt: CREATED,
-    updatedAt: CREATED,
-    completedAt: null,
-    failedAt: null,
-    ...overrides,
-  }
-}
-
-function fixtureCondition(id, title) {
-  return { id, title, createdAt: CREATED }
-}
-
-test('v2 acceptance: the scheduler launches, skips and settles per-node executions', async (t) => {
-  const root = await mkdtemp(join(tmpdir(), 'task-dag-accept-scheduler-'))
-  const workspace = {
-    workspaceId: SCHEDULER_WORKSPACE_ID,
-    path: root,
-    title: '定时验收',
-  }
-  const store = new GraphStore()
-
-  let storeRef
-  const promptSnapshots = []
-  const gateway = createGateway(root, {
-    createId: (sequence) => `sched-${sequence}`,
-    onPrompt: (request) => {
-      const graph = storeRef.read(workspace).graph
-      const node = graph.nodes.find((item) => (item.sessions ?? []).some(
-        (session) => session.sessionId === request.sessionId && session.retiredAt === null,
-      ))
-      const record = node?.sessions.find((session) => session.sessionId === request.sessionId)
-      promptSnapshots.push({
-        sessionId: request.sessionId,
-        nodeId: node?.id ?? null,
-        status: node?.status ?? null,
-        mode: record?.handoff?.mode ?? null,
-      })
-    },
-  })
-  storeRef = store
-
-  const seeded = {
-    schemaVersion: 2,
-    workspaceId: SCHEDULER_WORKSPACE_ID,
-    workspacePath: root,
-    title: '定时验收',
-    revision: 0,
-    updatedAt: null,
-    milestoneNodeId: null,
-    nodes: [
-      scheduleFixtureNode({
-        id: 'n_ok',
-        title: '照常执行',
-        agentPreset: 'preset-a',
-        model: 'openai/gpt-x',
-      }),
-      scheduleFixtureNode({ id: 'n_bad', title: '执行失败' }),
-      scheduleFixtureNode({
-        id: 'n_blocked',
-        title: '条件未满足',
-        conditions: [fixtureCondition('c_blk', '前置完成')],
-      }),
-      scheduleFixtureNode({ id: 'n_planned', title: '待规划不跑', status: 'planned' }),
-      scheduleFixtureNode({ id: 'n_pre', title: '前置任务', status: 'doing', schedule: null }),
-      scheduleFixtureNode({
-        id: 'n_after',
-        title: '失败节点的后继',
-        schedule: null,
-        conditions: [fixtureCondition('c_after', '执行失败 完成')],
-      }),
-    ],
-    edges: [
-      { id: 'e_blk', from: 'n_pre', to: 'n_blocked', conditionId: 'c_blk' },
-      { id: 'e_after', from: 'n_bad', to: 'n_after', conditionId: 'c_after' },
-    ],
-  }
-  await store.commit(workspace, 0, () => ({ next: seeded, event: { type: 'test/seed' } }))
-
-  const ctx = {
-    typertGateway: gateway,
-    sessions: { get: () => undefined },
-    workspaceRegistry: {
-      list: () => [{ id: SCHEDULER_WORKSPACE_ID, path: root, title: '定时验收', sessionIds: [] }],
-    },
-  }
-  const scheduler = new TaskDagScheduler(ctx, store, {
-    now: () => SCHEDULER_NOW,
-    tickMs: 10 * 60 * 1000,
-    pollMs: 10 * 60 * 1000,
-  })
-  t.after(() => {
-    scheduler.dispose()
-    return rm(root, { recursive: true, force: true })
-  })
-
-  await scheduler.tick(SCHEDULER_NOW)
-
-  // --- launch order -------------------------------------------------
-  assert.deepEqual(gateway.created, ['sched-1', 'sched-2'])
-  const sessionMethods = gateway.calls
-    .map((call) => `${call.namespace}/${call.method}`)
-    .filter((name) => name.startsWith('session/') && name !== 'session/list')
-  assert.deepEqual(sessionMethods, [
-    'session/create',
-    'session/selectModel',
-    'session/rename',
-    'session/prompt',
-    'session/create',
-    'session/rename',
-    'session/prompt',
-  ])
-
-  const createCalls = gateway.calls.filter((call) => call.method === 'create')
-  assert.deepEqual(createCalls[0].args.request, {
-    workspaceId: SCHEDULER_WORKSPACE_ID,
-    agentPreset: 'preset-a',
-  })
-  assert.deepEqual(createCalls[1].args.request, { workspaceId: SCHEDULER_WORKSPACE_ID })
-  assert.deepEqual(gateway.selectModels, [{
-    sessionId: 'sched-1',
-    model: 'gpt-x',
-    provider: 'openai',
-  }])
-
-  // The attach commit happened before the prompt: at prompt time the created
-  // session is already the node's current, scheduled session.
-  assert.deepEqual(promptSnapshots, [
-    { sessionId: 'sched-1', nodeId: 'n_ok', status: 'doing', mode: 'scheduled' },
-    { sessionId: 'sched-2', nodeId: 'n_bad', status: 'doing', mode: 'scheduled' },
-  ])
-  assert.match(gateway.prompts[0].content[0].text, /^# 定时执行：照常执行/)
-  assert.match(gateway.prompts[0].content[0].text, /## 前置条件（全部满足才会触发）/)
-  assert.match(gateway.prompts[0].content[0].text, /- 无（无条件，可直接开始）/)
-  assert.match(gateway.prompts[1].content[0].text, /^# 定时执行：执行失败/)
-
-  // --- per-node schedule/launch state -------------------------------
-  let graph = store.read(workspace).graph
-  const launchedOk = graph.nodes.find((node) => node.id === 'n_ok')
-  assert.equal(launchedOk.status, 'doing')
-  assert.equal(launchedOk.completedAt, null)
-  assert.equal(launchedOk.failedAt, null)
-  assert.equal(launchedOk.schedule.lastTriggeredAt, new Date(SCHEDULER_NOW).toISOString())
-  assert.equal(
-    launchedOk.schedule.nextRunAt,
-    new Date(2026, 9, 29, 9, 0, 0, 0).toISOString(),
-    'the next occurrence is computed from now, not from the missed one',
-  )
-  assert.equal(launchedOk.schedule.lastSessionId, 'sched-1')
-  assert.equal(launchedOk.sessions.length, 1)
-  assert.equal(launchedOk.sessions[0].sessionId, 'sched-1')
-  assert.equal(launchedOk.sessions[0].retiredAt, null)
-  assert.equal(launchedOk.sessions[0].slot, 1)
-  assert.deepEqual(launchedOk.sessions[0].handoff, { from: null, mode: 'scheduled' })
-
-  const launchedBad = graph.nodes.find((node) => node.id === 'n_bad')
-  assert.equal(launchedBad.status, 'doing')
-  assert.equal(launchedBad.schedule.lastSessionId, 'sched-2')
-
-  // --- skip rules ---------------------------------------------------
-  const skippedByCondition = graph.nodes.find((node) => node.id === 'n_blocked')
-  assert.equal(skippedByCondition.status, 'todo')
-  assert.equal(skippedByCondition.schedule.lastResult, 'skipped')
-  assert.match(skippedByCondition.schedule.lastSkippedReason, /前置条件未满足：前置完成/)
-  assert.equal(skippedByCondition.schedule.lastSessionId, null)
-  assert.deepEqual(skippedByCondition.sessions, [])
-  assert.equal(
-    skippedByCondition.schedule.nextRunAt,
-    new Date(2026, 9, 29, 9, 0, 0, 0).toISOString(),
-  )
-
-  const skippedByStatus = graph.nodes.find((node) => node.id === 'n_planned')
-  assert.equal(skippedByStatus.status, 'planned')
-  assert.equal(skippedByStatus.schedule.lastResult, 'skipped')
-  assert.match(skippedByStatus.schedule.lastSkippedReason, /待开始/)
-
-  assert.deepEqual(
-    expectSort(scheduler.pendingExecutions().map((entry) => entry.nodeId)),
-    ['n_bad', 'n_ok'],
-  )
-
-  // --- settlement: session/list says idle, events decide the outcome --
-  gateway.states.get('sched-1').running = false
-  gateway.states.get('sched-2').running = false
-  gateway.events['sched-1'] = [
-    { type: 'turn/start', seq: 1, time: 1, data: {} },
-    { type: 'user/message', seq: 2, time: 2, data: { text: '开始' } },
-    { type: 'turn/end', seq: 3, time: 3, data: { reason: { kind: 'completed' } } },
-  ]
-  gateway.events['sched-2'] = [
-    { type: 'turn/start', seq: 1, time: 1, data: {} },
-    { type: 'turn/end', seq: 2, time: 2, data: { reason: { kind: 'error', message: '模型调用失败' } } },
-  ]
-
-  const settledAt = SCHEDULER_NOW + 5_000
-  await scheduler.pollExecutions(settledAt)
-
-  graph = store.read(workspace).graph
-  const doneNode = graph.nodes.find((node) => node.id === 'n_ok')
-  assert.equal(doneNode.status, 'done')
-  assert.equal(doneNode.completedAt, new Date(settledAt).toISOString())
-  assert.equal(doneNode.failedAt, null)
-  assert.equal(doneNode.schedule.lastResult, 'succeeded')
-  assert.equal(doneNode.schedule.lastFinishedAt, new Date(settledAt).toISOString())
-  assert.equal(doneNode.schedule.lastError, null)
-
-  const failedNode = graph.nodes.find((node) => node.id === 'n_bad')
-  assert.equal(failedNode.status, 'failed')
-  assert.equal(failedNode.failedAt, new Date(settledAt).toISOString())
-  assert.equal(failedNode.completedAt, null)
-  assert.equal(failedNode.schedule.lastResult, 'failed')
-  assert.match(failedNode.schedule.lastError, /模型调用失败/)
-  // A failed node may not keep outgoing edges: the failure detaches them.
-  assert.deepEqual(graph.edges.filter((item) => item.from === 'n_bad'), [])
-  const afterNode = graph.nodes.find((node) => node.id === 'n_after')
-  assert.equal(afterNode.conditions.length, 1, 'the successor condition survives')
-  assert.equal(afterNode.status, 'todo')
-
-  assert.deepEqual(scheduler.pendingExecutions(), [])
 })

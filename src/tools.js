@@ -8,7 +8,7 @@
  * v2 semantics: a node owns `conditions[]` and an edge satisfies exactly one of
  * them, so tools talk about 前置条件 rather than a single "prerequisite" edge.
  * Agents may not delete nodes, cut edges, delete conditions, change the
- * milestone or configure schedules — those stay human-only.
+ * milestone or configure a timing window — those stay human-only.
  *
  * Definitions are written in the *compiled* JSON Schema dialect that
  * `ctx.tools.register` expects (`parameters` is raw JSON Schema, not the author
@@ -48,8 +48,6 @@ const STATUS_LABELS = Object.freeze({
   done: '已完成',
   failed: '已失败',
 })
-
-const SCHEDULE_RESULTS = ['succeeded', 'failed', 'skipped']
 
 const PROGRESS_SCHEMA = Object.freeze({
   type: 'object',
@@ -110,16 +108,16 @@ const CONDITION_VIEW_SCHEMA = Object.freeze({
   },
 })
 
-const SCHEDULE_SUMMARY_SCHEMA = Object.freeze({
+const TIMING_SUMMARY_SCHEMA = Object.freeze({
   type: ['object', 'null'],
   additionalProperties: false,
-  required: ['enabled', 'cron', 'nextRunAt', 'lastResult', 'lastError'],
+  required: ['startAt', 'deadlineAt', 'maxRunMinutes', 'lastTimeoutAt', 'lastTimeoutReason'],
   properties: {
-    enabled: { type: 'boolean' },
-    cron: { type: ['string', 'null'] },
-    nextRunAt: { type: ['string', 'null'] },
-    lastResult: { type: ['string', 'null'] },
-    lastError: { type: ['string', 'null'] },
+    startAt: { type: ['string', 'null'] },
+    deadlineAt: { type: ['string', 'null'] },
+    maxRunMinutes: { type: ['integer', 'null'] },
+    lastTimeoutAt: { type: ['string', 'null'] },
+    lastTimeoutReason: { type: ['string', 'null'] },
   },
 })
 
@@ -239,14 +237,14 @@ function presetOf(value) {
   return typeof value === 'string' && value.trim() !== '' ? value : null
 }
 
-function scheduleSummary(schedule) {
-  if (schedule === null || typeof schedule !== 'object' || Array.isArray(schedule)) return null
+function timingSummary(timing) {
+  if (timing === null || typeof timing !== 'object' || Array.isArray(timing)) return null
   return {
-    enabled: schedule.enabled === true,
-    cron: typeof schedule.cron === 'string' ? schedule.cron : null,
-    nextRunAt: typeof schedule.nextRunAt === 'string' ? schedule.nextRunAt : null,
-    lastResult: SCHEDULE_RESULTS.includes(schedule.lastResult) ? schedule.lastResult : null,
-    lastError: typeof schedule.lastError === 'string' ? schedule.lastError : null,
+    startAt: typeof timing.startAt === 'string' ? timing.startAt : null,
+    deadlineAt: typeof timing.deadlineAt === 'string' ? timing.deadlineAt : null,
+    maxRunMinutes: Number.isInteger(timing.maxRunMinutes) ? timing.maxRunMinutes : null,
+    lastTimeoutAt: typeof timing.lastTimeoutAt === 'string' ? timing.lastTimeoutAt : null,
+    lastTimeoutReason: typeof timing.lastTimeoutReason === 'string' ? timing.lastTimeoutReason : null,
   }
 }
 
@@ -452,7 +450,7 @@ export function buildGraphMap(workspace, graph, derived) {
       agentPreset: presetOf(node.agentPreset),
       model: presetOf(node.model),
       reasoningEffort: presetOf(node.reasoningEffort),
-      schedule: scheduleSummary(node.schedule),
+      timing: timingSummary(node.timing),
       prereqs,
       sessionCount: Array.isArray(node.sessions) ? node.sessions.length : 0,
       activeSessionId: activeSession(node)?.sessionId ?? null,
@@ -562,7 +560,9 @@ function renderMapText(value) {
       if (node.agentPreset !== null) extras.push(`预设 ${node.agentPreset}`)
       if (node.model !== null) extras.push(`模型 ${node.model}`)
       if (node.reasoningEffort !== null) extras.push(`推理 ${node.reasoningEffort}`)
-      if (node.schedule?.enabled === true) extras.push(`定时 ${node.schedule.cron ?? '未配置'}`)
+      if (node.timing?.startAt) extras.push(`最早开始 ${node.timing.startAt}`)
+      if (node.timing?.maxRunMinutes) extras.push(`限时 ${node.timing.maxRunMinutes} 分钟`)
+      if (node.timing?.deadlineAt) extras.push(`截止 ${node.timing.deadlineAt}`)
       const suffix = extras.length === 0 ? '' : `（${extras.join('，')}）`
       lines.push(`- ${node.title}（${node.id}）[${statusLabel(node.status)}] ${conditionText}${suffix}`)
     }
@@ -687,7 +687,7 @@ export function buildToolDefinitions(ctx, store) {
                 additionalProperties: false,
                 required: [
                   'id', 'title', 'status', 'conditions', 'agentPreset', 'model', 'reasoningEffort',
-                  'schedule', 'prereqs', 'sessionCount', 'activeSessionId', 'ready', 'blocked',
+                  'timing', 'prereqs', 'sessionCount', 'activeSessionId', 'ready', 'blocked',
                 ],
                 properties: {
                   id: { type: 'string' },
@@ -697,7 +697,7 @@ export function buildToolDefinitions(ctx, store) {
                   agentPreset: { type: ['string', 'null'] },
                   model: { type: ['string', 'null'] },
                   reasoningEffort: { type: ['string', 'null'] },
-                  schedule: SCHEDULE_SUMMARY_SCHEMA,
+                  timing: TIMING_SUMMARY_SCHEMA,
                   prereqs: { type: 'array', items: NODE_BRIEF_SCHEMA },
                   sessionCount: { type: 'integer' },
                   activeSessionId: { type: ['string', 'null'] },

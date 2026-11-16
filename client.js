@@ -3,7 +3,8 @@
  *
  * One project workspace is shown as an editable task DAG (v2): five-state
  * nodes, prerequisite conditions (edges satisfy one condition each), per-node
- * agent preset/model, per-node cron schedule, and one project milestone (a
+ * agent preset/model, per-node timing window (earliest start, per-run limit and
+ * absolute deadline), and one project milestone (a
  * marker only: a done milestone never finishes the project). Each node owns an
  * ordered chain of chat sessions with exactly one current session.
  *
@@ -12,7 +13,11 @@
  * a long node title to the card width and clips whatever still overflows, can
  * undo a node drag or an auto layout, and turns an Alt + left-drag lasso of
  * fully enclosed nodes into a named group with a dashed, grid-aligned contour.
- * The detail drawer autosaves its text drafts before the selection moves. The
+ * The middle column can be switched between that editable canvas and a five-
+ * column task board (one column per status; a card opens the same detail
+ * drawer). The header also hands the project's graph folder to the system file
+ * manager. The detail drawer autosaves its text drafts before the selection
+ * moves and treats Tab as a tab character inside the task description. The
  * Host half owns the graph file (including groups); this file only renders the
  * snapshot and posts actions back to it.
  *
@@ -30,11 +35,11 @@
  *   - colours come only from `--dsw-alias-*` theme tokens.
  *
  * Sections:
- *   0. imports            5. HTTP transport      10. SVG canvas
- *   1. constants          6. graph model         11. detail drawer
- *   2. stylesheet         7. platform bridges    12. panel page
- *   3. local storage      8. small atoms         13. icon / apply
- *   4. pure helpers       9. workspace column
+ *   0. imports            5. HTTP transport      10. task board
+ *   1. constants          6. graph model         11. SVG canvas
+ *   2. stylesheet         7. platform bridges    12. detail drawer
+ *   3. local storage      8. small atoms         13. panel page
+ *   4. pure helpers       9. workspace column    14. icon / apply
  */
 window.__ModuleLoader__.load({
   id: 'dsh-task-dag',
@@ -64,6 +69,7 @@ window.__ModuleLoader__.load({
       action: API + '/action',
       events: API + '/events',
       catalog: API + '/catalog',
+      openFolder: API + '/open-folder',
     }
     const STORAGE_KEY = 'dsh.task-dag'
     const STYLE_TAG = 'dsh-task-dag'
@@ -321,22 +327,13 @@ window.__ModuleLoader__.load({
       brief: '简报交接',
       blank: '空会话交接',
       attach: '挂接已有会话',
-      scheduled: '定时执行',
+      scheduled: '旧版定时执行',
     }
-    const SCHEDULE_RESULT_LABELS = {
-      succeeded: '成功',
-      failed: '失败',
-      skipped: '已跳过',
+    const TIMEOUT_LABELS = {
+      'run-limit': '超出单次最长执行时长',
+      deadline: '到达最晚结束时间',
     }
-    // Common 5-field cron expressions; the Host computes the next run in its
-    // own local time zone (same convention as the task-board scheduler).
-    const CRON_PRESETS = [
-      { cron: '0 9 * * *', label: '每天 9:00' },
-      { cron: '0 9 * * 1-5', label: '工作日 9:00' },
-      { cron: '0 9 * * 1', label: '每周一 9:00' },
-      { cron: '0 * * * *', label: '每小时' },
-      { cron: '*/30 * * * *', label: '每 30 分钟' },
-    ]
+    const MAX_RUN_MINUTES = 10080
     const CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
 
     // =======================================================================
@@ -455,6 +452,28 @@ window.__ModuleLoader__.load({
       '.dsh-td-overlay-text{font-size:var(--dsh-td-fs-sm);line-height:1.7;color:var(--dsw-alias-label-secondary)}',
       '.dsh-td-empty{padding:18px 12px;font-size:var(--dsh-td-fs-sm);line-height:1.7;text-align:center;color:var(--dsw-alias-label-tertiary)}',
 
+      // kanban view — five status columns, mirroring the task board's columns
+      '.dsh-td-board{position:relative;flex:1 1 auto;min-width:0;min-height:0;display:flex;flex-direction:column;padding:12px;background:var(--dsw-alias-bg-base);overflow:hidden}',
+      '.dsh-td-board-columns{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(196px,1fr);gap:12px;flex:1 1 auto;min-height:0;overflow-x:auto;overflow-y:hidden;padding-bottom:6px}',
+      '.dsh-td-board-column{display:flex;flex-direction:column;min-height:0;background:var(--dsw-alias-bg-layer-2);border:.5px solid var(--dsw-alias-border-l1);border-radius:12px;overflow:hidden}',
+      '.dsh-td-board-head{display:flex;align-items:center;gap:8px;padding:8px 10px;min-height:36px;flex:0 0 auto}',
+      '.dsh-td-board-head .dsh-td-dot{width:8px;height:8px}',
+      '.dsh-td-board-title{margin:0;flex:1 1 auto;min-width:0;font-size:var(--dsh-td-fs-sm);font-weight:700;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dsh-td-board-count{flex:0 0 auto;padding:0 8px;font-size:var(--dsh-td-fs-xs);line-height:20px;color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-interactive-bg-hover);border-radius:999px;font-variant-numeric:tabular-nums}',
+      '.dsh-td-board-cards{display:flex;flex-direction:column;gap:8px;padding:2px 10px 10px;overflow-y:auto;flex:1 1 auto;min-height:0}',
+      '.dsh-td-board-empty{padding:24px 0;text-align:center;font-size:var(--dsh-td-fs-xs);color:var(--dsw-alias-label-tertiary)}',
+      '.dsh-td-board-card{position:relative;display:flex;flex-direction:column;gap:6px;flex:0 0 auto;margin:0;padding:9px 10px 9px 13px;text-align:left;font:inherit;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-base);border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;cursor:pointer;overflow:hidden;transition:box-shadow 120ms ease,border-color 120ms ease}',
+      '.dsh-td-board-card::before{content:"";position:absolute;top:0;bottom:0;left:0;width:3px;background:var(--dsw-alias-label-tertiary)}',
+      '.dsh-td-board-card[data-status="todo"]::before{background:var(--dsw-alias-state-business-primary)}',
+      '.dsh-td-board-card[data-status="doing"]::before{background:var(--dsw-alias-state-warn-primary)}',
+      '.dsh-td-board-card[data-status="done"]::before{background:var(--dsw-alias-state-success-primary)}',
+      '.dsh-td-board-card[data-status="failed"]::before{background:var(--dsw-alias-state-error-primary)}',
+      '.dsh-td-board-card:hover{border-color:var(--dsw-alias-border-l3);box-shadow:var(--dsw-shadow-lv2)}',
+      '.dsh-td-board-card:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px}',
+      '.dsh-td-board-card-on{border-color:var(--dsw-alias-brand-primary);box-shadow:0 0 0 1px var(--dsw-alias-brand-primary) inset}',
+      '.dsh-td-board-card-title{font-size:var(--dsh-td-fs-sm);font-weight:600;line-height:1.45;word-break:break-word;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}',
+      '.dsh-td-board-card-meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px;min-height:16px}',
+
       // svg graph
       '.dsh-td-arrowhead{fill:var(--dsw-alias-label-caption)}',
       '.dsh-td-arrowhead-active{fill:var(--dsw-alias-brand-primary)}',
@@ -484,7 +503,7 @@ window.__ModuleLoader__.load({
       '.dsh-td-node-failed .dsh-td-node-bg{stroke:var(--dsw-alias-state-error-primary);stroke-width:1.6}',
       '.dsh-td-node-failed .dsh-td-node-title{fill:var(--dsw-alias-label-tertiary)}',
       '.dsh-td-node-failed .dsh-td-node-meta{fill:var(--dsw-alias-state-error-primary)}',
-      '.dsh-td-node-scheduled .dsh-td-node-flag{fill:var(--dsw-alias-state-warn-primary)}',
+      '.dsh-td-node-timing .dsh-td-node-flag{fill:var(--dsw-alias-state-warn-primary)}',
       '.dsh-td-node-milestone .dsh-td-node-flag{fill:var(--dsw-alias-state-success-primary);paint-order:stroke;stroke:var(--dsw-alias-bg-base);stroke-width:3px}',
       '.dsh-td-node-title{fill:var(--dsw-alias-label-primary);font-size:var(--dsh-td-fs);font-weight:500;font-family:inherit}',
       '.dsh-td-node-meta{fill:var(--dsw-alias-label-tertiary);font-size:var(--dsh-td-fs-xs);font-family:inherit}',
@@ -640,9 +659,9 @@ window.__ModuleLoader__.load({
       '.dsh-td-option-meta{font-size:var(--dsh-td-fs-xxs);line-height:1.5;color:var(--dsw-alias-label-tertiary)}',
       '.dsh-td-link-foot{display:flex;align-items:center;justify-content:flex-end;gap:6px}',
       '.dsh-td-presets{display:flex;flex-wrap:wrap;gap:4px}',
-      '.dsh-td-sched-line{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:var(--dsh-td-fs-xs);color:var(--dsw-alias-label-secondary)}',
-      '.dsh-td-sched-value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
-      // collapsible sections (execution settings, schedule, danger zone)
+      '.dsh-td-timing-line{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:var(--dsh-td-fs-xs);color:var(--dsw-alias-label-secondary)}',
+      '.dsh-td-timing-value{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
+      // collapsible sections (execution settings, timing window, danger zone)
       '.dsh-td-collapse{display:flex;flex-direction:column;gap:6px}',
       '.dsh-td-collapse-head{display:flex;align-items:center;gap:6px;width:100%;padding:4px 2px;border:0;background:transparent;',
       'font:inherit;cursor:pointer;text-align:left;color:inherit;border-radius:var(--dsw-radius-sm)}',
@@ -762,6 +781,13 @@ window.__ModuleLoader__.load({
       return persisted !== null && typeof persisted === 'object' && persisted.layoutMode === 'grid'
         ? 'grid'
         : 'free'
+    }
+
+    /** `graph` is the editable DAG canvas; `board` is the read-first kanban. */
+    function readViewMode(persisted) {
+      return persisted !== null && typeof persisted === 'object' && persisted.viewMode === 'board'
+        ? 'board'
+        : 'graph'
     }
 
     // =======================================================================
@@ -3371,17 +3397,39 @@ window.__ModuleLoader__.load({
       return d + ' Z'
     }
 
-    function formatNextRun(schedule) {
-      if (schedule === null || typeof schedule !== 'object') return ''
-      const text = formatTime(schedule.nextRunAt)
-      return text
+    /** `datetime-local` value (local wall clock) for an ISO instant. */
+    function toTimingInput(value) {
+      if (typeof value !== 'string' || value === '') return ''
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return ''
+      const pad = (number) => String(number).padStart(2, '0')
+      return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate())
+        + 'T' + pad(date.getHours()) + ':' + pad(date.getMinutes())
     }
 
-    function scheduleResultText(schedule) {
-      if (schedule === null || typeof schedule !== 'object') return ''
-      const result = typeof schedule.lastResult === 'string' ? schedule.lastResult : ''
-      if (result === '') return '暂无记录'
-      return SCHEDULE_RESULT_LABELS[result] === undefined ? result : SCHEDULE_RESULT_LABELS[result]
+    /** The ISO instant a `datetime-local` field means, or null when empty. */
+    function fromTimingInput(value) {
+      if (typeof value !== 'string' || value.trim() === '') return null
+      const date = new Date(value)
+      return Number.isNaN(date.getTime()) ? null : date.toISOString()
+    }
+
+    /** Whether the node's earliest-start gate is already open. */
+    function startReached(timing, nowMs) {
+      if (timing === null || typeof timing !== 'object') return true
+      if (typeof timing.startAt !== 'string' || timing.startAt === '') return true
+      const startMs = Date.parse(timing.startAt)
+      return !Number.isFinite(startMs) || startMs <= nowMs
+    }
+
+    /** One compact line describing the configured window. */
+    function timingWindowText(timing) {
+      if (timing === null || typeof timing !== 'object') return ''
+      const parts = []
+      if (timing.startAt) parts.push('最早 ' + formatTime(timing.startAt))
+      if (timing.maxRunMinutes) parts.push('限时 ' + String(timing.maxRunMinutes) + ' 分钟')
+      if (timing.deadlineAt) parts.push('截止 ' + formatTime(timing.deadlineAt))
+      return parts.join(' · ')
     }
 
     // =======================================================================
@@ -3849,7 +3897,88 @@ window.__ModuleLoader__.load({
     }
 
     // =======================================================================
-    // 10. SVG canvas — pan/zoom, node drag, edge drag, edge selection.
+    // 10. Task board — five status columns over the same graph model.
+    //     Only the presentation changes: a card is a shortcut to the same node
+    //     detail drawer, never a second editing surface.
+    // =======================================================================
+    function KanbanBoard(props) {
+      const model = props.model
+      const columns = STATUSES.map((status) => {
+        const nodes = model.nodes.filter((node) => node.status === status)
+        if (status === 'todo') {
+          // The todo column mixes two different next actions: ready cards can be
+          // picked up now, blocked cards cannot. Keep the graph order inside each
+          // group but always float the ready half above the blocked half.
+          const rank = (node) => (model.ready.has(node.id) ? 0 : model.blocked.has(node.id) ? 1 : 2)
+          nodes.sort((a, b) => rank(a) - rank(b))
+        }
+        return { status, label: statusLabel(status), nodes }
+      })
+
+      return h('div', { className: 'dsh-td-board' },
+        h('div', { className: 'dsh-td-board-columns' },
+          columns.map((column) => h('section', {
+            key: column.status,
+            className: 'dsh-td-board-column',
+            'data-status': column.status,
+            'aria-label': column.label,
+          },
+            h('header', { className: 'dsh-td-board-head' },
+              h(StatusDot, { status: column.status }),
+              h('h3', { className: 'dsh-td-board-title' }, column.label),
+              h('span', { className: 'dsh-td-board-count' }, String(column.nodes.length)),
+            ),
+            h('div', { className: 'dsh-td-board-cards' },
+              column.nodes.length === 0
+                ? h('div', { className: 'dsh-td-board-empty' }, '暂无任务')
+                : column.nodes.map((node) => {
+                  const conditions = model.conditions[node.id] || []
+                  const satisfied = conditions.filter((condition) => condition.satisfied).length
+                  const sessions = Array.isArray(node.sessions) ? node.sessions.length : 0
+                  const timing = node.timing !== null && typeof node.timing === 'object' ? node.timing : null
+                  const isMilestone = model.milestoneNodeId === node.id
+                  const ready = node.status === 'todo' && model.ready.has(node.id)
+                  const blocked = node.status === 'todo' && model.blocked.has(node.id)
+                  const selected = props.selectedNodeId === node.id
+                  return h('button', {
+                    key: node.id,
+                    type: 'button',
+                    className: 'dsh-td-board-card' + (selected ? ' dsh-td-board-card-on' : ''),
+                    'data-status': column.status,
+                    'aria-current': selected ? 'true' : undefined,
+                    title: (node.title || '未命名任务') + ' · ' + column.label,
+                    onClick: () => props.onSelectNode(node.id),
+                  },
+                    h('span', { className: 'dsh-td-board-card-title' }, node.title || '未命名任务'),
+                    h('span', { className: 'dsh-td-board-card-meta' },
+                      ready ? h(Chip, { kind: 'success' }, '可开始') : null,
+                      blocked ? h(Chip, { kind: 'warn' }, '受阻') : null,
+                      conditions.length > 0
+                        ? h(Chip, { kind: 'muted' }, '条件 ' + String(satisfied) + '/' + String(conditions.length))
+                        : null,
+                      sessions > 0 ? h(Chip, { kind: 'muted' }, String(sessions) + ' 段会话') : null,
+                      timing !== null && timing.startAt
+                        ? h(Chip, { kind: startReached(timing, Date.now()) ? 'muted' : 'warn' },
+                          '计划 ' + formatTime(timing.startAt))
+                        : null,
+                      timing !== null && timing.maxRunMinutes
+                        ? h(Chip, { kind: 'muted' }, '限时 ' + String(timing.maxRunMinutes) + ' 分钟')
+                        : null,
+                      timing !== null && timing.deadlineAt
+                        ? h(Chip, { kind: 'warn' }, '截止 ' + formatTime(timing.deadlineAt))
+                        : null,
+                      isMilestone ? h(Chip, { kind: 'success' }, '里程碑') : null,
+                    ),
+                  )
+                }),
+            ),
+          )),
+        ),
+      )
+    }
+
+    // =======================================================================
+    // 11. SVG canvas — pan/zoom, node drag, edge drag, edge selection.
     // =======================================================================
     function NodeCard(props) {
       const node = props.node
@@ -3865,8 +3994,8 @@ window.__ModuleLoader__.load({
       const lines = titleLines(node.title)
       const status = STATUSES.indexOf(node.status) >= 0 ? node.status : 'todo'
       const isMilestone = model.milestoneNodeId === node.id
-      const schedule = node.schedule !== null && typeof node.schedule === 'object' ? node.schedule : null
-      const scheduled = schedule !== null && schedule.enabled === true
+      const timing = node.timing !== null && typeof node.timing === 'object' ? node.timing : null
+      const timed = timing !== null
       const conditionList = model.conditions[node.id] || []
       const satisfiedCount = conditionList.filter((condition) => condition.satisfied).length
       const showReady = node.status === 'todo' && model.ready.has(node.id)
@@ -3880,7 +4009,7 @@ window.__ModuleLoader__.load({
       if (props.emphasized) classes.push('dsh-td-node-emphasis')
       if (props.dragging) classes.push('dsh-td-node-dragging')
       if (status === 'failed') classes.push('dsh-td-node-failed')
-      if (scheduled) classes.push('dsh-td-node-scheduled')
+      if (timed) classes.push('dsh-td-node-timing')
       if (isMilestone) classes.push('dsh-td-node-milestone')
       if (props.multiSelected) classes.push('dsh-td-node-multi')
 
@@ -3893,7 +4022,7 @@ window.__ModuleLoader__.load({
         + (conditionList.length > 0
           ? ' · 前置条件 ' + conditionList.map((condition) => condition.title + (condition.satisfied ? '(已满足)' : '(未满足)')).join('、')
           : '')
-        + (scheduled ? ' · 定时执行' : '')
+        + (timed ? ' · 时间控制：' + timingWindowText(timing) : '')
         + (isMilestone ? ' · 项目里程碑' : '')
         + (sessions.length === 0
           ? ' · 无会话'
@@ -3959,7 +4088,7 @@ window.__ModuleLoader__.load({
           badgeSlot > 0
             ? h('text', { className: 'dsh-td-node-chain', x: NODE_W - 12, y: 68, textAnchor: 'end' }, circled(badgeSlot))
             : null,
-          scheduled
+          timed
             ? h('text', {
               className: 'dsh-td-node-flag',
               x: NODE_W - 12,
@@ -5024,7 +5153,7 @@ window.__ModuleLoader__.load({
     }
 
     // =======================================================================
-    // 11. Detail drawer — node editing, prerequisites, settings, session chain.
+    // 12. Detail drawer — node editing, prerequisites, settings, session chain.
     // =======================================================================
     // The condition chooser appears after a drag from a node's right handle to
     // another node: the user picks which prerequisite of the target the source
@@ -5513,8 +5642,9 @@ window.__ModuleLoader__.load({
       const presets = Array.isArray(catalog.presets) ? catalog.presets : []
       const models = Array.isArray(catalog.models) ? catalog.models : []
       const catalogWarnings = Array.isArray(catalog.warnings) ? catalog.warnings : []
-      const schedule = node.schedule !== null && typeof node.schedule === 'object' ? node.schedule : null
-      const scheduleEnabled = schedule !== null && schedule.enabled === true
+      const timing = node.timing !== null && typeof node.timing === 'object' ? node.timing : null
+      const timingActive = timing !== null
+        && (timing.startAt !== null || timing.maxRunMinutes !== null || timing.deadlineAt !== null)
       const isMilestone = model.milestoneNodeId === node.id
       const titleRef = useRef(null)
 
@@ -5530,9 +5660,12 @@ window.__ModuleLoader__.load({
       const [conditionTitle, setConditionTitle] = useState('')
       const [editingConditionId, setEditingConditionId] = useState(null)
       const [editingConditionTitle, setEditingConditionTitle] = useState('')
-      const [cronDraft, setCronDraft] = useState(
-        schedule !== null && typeof schedule.cron === 'string' ? schedule.cron : '',
+      const [startAtDraft, setStartAtDraft] = useState(() => toTimingInput(timing?.startAt))
+      const [maxRunDraft, setMaxRunDraft] = useState(
+        timing !== null && Number.isInteger(timing.maxRunMinutes) ? String(timing.maxRunMinutes) : '',
       )
+      const [deadlineDraft, setDeadlineDraft] = useState(() => toTimingInput(timing?.deadlineAt))
+      const [clockNow, setClockNow] = useState(() => Date.now())
       const [failPrompt, setFailPrompt] = useState(false)
       const [notesMode, setNotesMode] = useState('edit')
       const [notesHeight, setNotesHeight] = useState(() => readNotesHeight(readPersisted()))
@@ -5567,18 +5700,14 @@ window.__ModuleLoader__.load({
             timer: null,
             version: 0,
           },
-          cron: {
-            value: schedule !== null && typeof schedule.cron === 'string' ? schedule.cron : '',
-            dirty: false,
-            pending: false,
-            timer: null,
-            version: 0,
-          },
           condition: { value: '', dirty: false, pending: false, timer: null, version: 0, id: null },
         }
       }
       const flushAllDraftsRef = useRef(null)
       flushAllDraftsRef.current = () => flushAllDrafts(true)
+      // Timing inputs save explicitly (blur or the section's save button), so
+      // an unrelated snapshot must not overwrite a half-edited date.
+      const timingEditRef = useRef({ dirty: false, pending: false })
 
       useEffect(() => {
         const drafts = draftsRef.current
@@ -5595,10 +5724,14 @@ window.__ModuleLoader__.load({
           drafts.notes.value = hostNotes
           setNotes(hostNotes)
         }
-        const hostCron = schedule !== null && typeof schedule.cron === 'string' ? schedule.cron : ''
-        if (drafts.cron.dirty !== true && drafts.cron.pending !== true) {
-          drafts.cron.value = hostCron
-          setCronDraft(hostCron)
+        if (deletedRef.current !== true && timingEditRef.current.dirty !== true
+          && timingEditRef.current.pending !== true) {
+          const hostTiming = node.timing !== null && typeof node.timing === 'object' ? node.timing : null
+          setStartAtDraft(toTimingInput(hostTiming?.startAt))
+          setMaxRunDraft(hostTiming !== null && Number.isInteger(hostTiming.maxRunMinutes)
+            ? String(hostTiming.maxRunMinutes)
+            : '')
+          setDeadlineDraft(toTimingInput(hostTiming?.deadlineAt))
         }
         if (drafts.condition.dirty !== true && drafts.condition.pending !== true) setEditingConditionId(null)
         setFailPrompt(false)
@@ -5637,6 +5770,14 @@ window.__ModuleLoader__.load({
         }
         props.onTitleFocused()
       }, [props.focusTitle, props.onTitleFocused])
+
+      // A start time passing is not a graph change, so the "not yet" state
+      // would otherwise stay stale until an unrelated snapshot arrived.
+      useEffect(() => {
+        const timer = setInterval(() => setClockNow(Date.now()), 30_000)
+        timer.unref?.()
+        return () => clearInterval(timer)
+      }, [])
 
       // Notes height drag. The listener is installed once and reads the drag
       // origin from a ref, so it stays correct across re-renders.
@@ -5787,29 +5928,6 @@ window.__ModuleLoader__.load({
           return
         }
 
-        if (kind === 'cron') {
-          const next = draft.value.trim()
-          const currentSchedule = current.schedule !== null && typeof current.schedule === 'object'
-            ? current.schedule
-            : null
-          const previous = currentSchedule !== null && typeof currentSchedule.cron === 'string'
-            ? currentSchedule.cron
-            : ''
-          if (next === '') {
-            if (final !== true) return
-            draft.dirty = false
-            draft.value = previous
-            setCronDraft(previous)
-            return
-          }
-          if (next === previous) {
-            draft.dirty = false
-            return
-          }
-          submitDraft(draft, version, 'set-schedule', { nodeId: current.id, cron: next })
-          return
-        }
-
         if (kind === 'condition') {
           const conditionId = draft.id
           const conditionList = Array.isArray(current.conditions) ? current.conditions : []
@@ -5850,9 +5968,10 @@ window.__ModuleLoader__.load({
       }
 
       function flushAllDrafts(final) {
-        for (const kind of ['title', 'notes', 'cron', 'condition']) {
+        for (const kind of ['title', 'notes', 'condition']) {
           flushDraft(kind, final === true)
         }
+        if (timingEditRef.current.dirty === true) saveTiming(false)
       }
 
       // -- notes: resize + Markdown editing ---------------------------------
@@ -5906,6 +6025,43 @@ window.__ModuleLoader__.load({
             }
           }, 0)
         }
+      }
+
+      // Inside the description a Tab is a typing character, not a focus move:
+      // a task note may contain indentation, code blocks or tables, and leaving
+      // the field on every Tab makes those impossible to type. Both Tab and
+      // Shift+Tab insert a tab; leaving the field is done with the mouse or a
+      // keyboard focus accelerator instead.
+      function insertNotesTab() {
+        const element = notesRef.current
+        const value = typeof notes === 'string' ? notes : ''
+        const rawStart = element !== null && element !== undefined ? element.selectionStart : null
+        const rawEnd = element !== null && element !== undefined ? element.selectionEnd : null
+        const start = Number.isInteger(rawStart) && rawStart >= 0 && rawStart <= value.length ? rawStart : value.length
+        const end = Number.isInteger(rawEnd) && rawEnd >= start && rawEnd <= value.length ? rawEnd : start
+        const next = value.slice(0, start) + '\t' + value.slice(end)
+        setNotes(next)
+        setDraftValue('notes', next)
+        if (element !== null && element !== undefined) {
+          setTimeout(() => {
+            try {
+              if (typeof element.focus === 'function') element.focus()
+              if (typeof element.setSelectionRange === 'function') {
+                const cursor = start + 1
+                element.setSelectionRange(cursor, cursor)
+              }
+            } catch (error) {
+              // A detached textarea needs no selection restore.
+            }
+          }, 0)
+        }
+      }
+
+      function handleNotesKeyDown(event) {
+        if (event.key !== 'Tab') return
+        if (event.ctrlKey === true || event.metaKey === true || event.altKey === true) return
+        event.preventDefault()
+        insertNotesTab()
       }
 
       function toggleAttach() {
@@ -6047,52 +6203,77 @@ window.__ModuleLoader__.load({
         }, '已保存模型与推理强度')
       }
 
-      // -- schedule ----------------------------------------------------------
-      function syncCronDraft(cron) {
-        const draft = draftsRef.current.cron
-        draft.value = cron
-        draft.dirty = false
-        draft.version += 1
-        if (draft.timer !== null) {
-          clearTimeout(draft.timer)
-          draft.timer = null
+      // -- timing window (earliest start / run limit / absolute deadline) ----
+      function markTimingDirty() {
+        timingEditRef.current.dirty = true
+      }
+
+      async function saveTiming(notify, overrides) {
+        const edit = timingEditRef.current
+        if (edit.pending === true) return false
+        const patch = overrides !== null && typeof overrides === 'object' ? overrides : {}
+        const startText = Object.hasOwn(patch, 'startAt') ? patch.startAt : startAtDraft
+        const deadlineText = Object.hasOwn(patch, 'deadlineAt') ? patch.deadlineAt : deadlineDraft
+        const maxTextRaw = Object.hasOwn(patch, 'maxRunMinutes') ? patch.maxRunMinutes : maxRunDraft
+        const startAt = fromTimingInput(startText)
+        const deadlineAt = fromTimingInput(deadlineText)
+        if (startText.trim() !== '' && startAt === null) {
+          props.notify('warn', '最早开始时间格式不正确')
+          return false
+        }
+        if (deadlineText.trim() !== '' && deadlineAt === null) {
+          props.notify('warn', '最晚结束时间格式不正确')
+          return false
+        }
+        if (startAt !== null && deadlineAt !== null && Date.parse(deadlineAt) <= Date.parse(startAt)) {
+          props.notify('warn', '最晚结束时间必须晚于最早开始时间')
+          return false
+        }
+        let maxRunMinutes = null
+        const maxText = maxTextRaw.trim()
+        if (maxText !== '') {
+          const minutes = Number(maxText)
+          if (!Number.isFinite(minutes) || minutes < 1 || minutes > MAX_RUN_MINUTES) {
+            props.notify('warn', '最长执行时长需要在 1–' + String(MAX_RUN_MINUTES) + ' 分钟之间')
+            return false
+          }
+          maxRunMinutes = Math.floor(minutes)
+        }
+
+        edit.pending = true
+        try {
+          const result = await props.act('set-timing', {
+            nodeId: node.id,
+            startAt,
+            deadlineAt,
+            maxRunMinutes,
+          }, { quiet: notify !== true })
+          if (result !== null && result !== undefined && result.ok === true) {
+            edit.dirty = false
+            if (notify === true) props.notify('info', '已保存时间设置')
+            return true
+          }
+          if (notify === true) props.notify('error', result?.message || '保存时间设置失败')
+          return false
+        } finally {
+          edit.pending = false
         }
       }
 
-      async function toggleSchedule() {
-        if (scheduleEnabled) {
-          syncCronDraft(cronDraft)
-          await act('set-schedule', { nodeId: node.id, enabled: false }, '已关闭定时执行')
-          return
+      function clearTimingField(kind) {
+        if (kind === 'startAt') {
+          setStartAtDraft('')
+          markTimingDirty()
+          void saveTiming(false, { startAt: '' })
+        } else if (kind === 'deadlineAt') {
+          setDeadlineDraft('')
+          markTimingDirty()
+          void saveTiming(false, { deadlineAt: '' })
+        } else if (kind === 'maxRunMinutes') {
+          setMaxRunDraft('')
+          markTimingDirty()
+          void saveTiming(false, { maxRunMinutes: '' })
         }
-        let cron = cronDraft.trim()
-        if (cron === '') {
-          cron = '0 9 * * *'
-          setCronDraft(cron)
-        }
-        syncCronDraft(cron)
-        await act('set-schedule', { nodeId: node.id, enabled: true, cron }, '已启用定时执行')
-      }
-
-      async function saveCron() {
-        const cron = cronDraft.trim()
-        if (cron === '') {
-          props.notify('warn', '请先填写 5 段 cron 表达式')
-          return
-        }
-        syncCronDraft(cron)
-        const result = await act('set-schedule', { nodeId: node.id, cron }, '已保存定时表达式')
-        if (result === null || result === undefined || result.ok !== true) {
-          const draft = draftsRef.current.cron
-          draft.value = cron
-          draft.dirty = true
-        }
-      }
-
-      function applyCronPreset(cron) {
-        setCronDraft(cron)
-        syncCronDraft(cron)
-        act('set-schedule', { nodeId: node.id, cron }, '已应用定时预设')
       }
 
       // -- milestone ---------------------------------------------------------
@@ -6275,22 +6456,17 @@ window.__ModuleLoader__.load({
               ? effortNameOf(selectedModelInfo.reasoning, nodeReasoningEffort)
               : nodeReasoningEffort))
 
-      // -- schedule summary --------------------------------------------------
-      const scheduleNextRun = formatNextRun(schedule)
-      const scheduleLastResult = scheduleResultText(schedule)
-      const scheduleLastRun = schedule !== null
-        && (typeof schedule.lastFinishedAt === 'string' || typeof schedule.lastTriggeredAt === 'string')
-        ? formatTime(typeof schedule.lastFinishedAt === 'string' && schedule.lastFinishedAt !== ''
-          ? schedule.lastFinishedAt
-          : schedule.lastTriggeredAt)
+      // -- timing summary ----------------------------------------------------
+      const timingNote = timingActive ? timingWindowText(timing) : '未设置'
+      const timingLastTimeout = timing !== null
+        && typeof timing.lastTimeoutAt === 'string'
+        && timing.lastTimeoutAt !== ''
+        ? formatTime(timing.lastTimeoutAt)
+          + (timing.lastTimeoutReason !== null
+            ? '（' + (TIMEOUT_LABELS[timing.lastTimeoutReason] || timing.lastTimeoutReason) + '）'
+            : '')
         : ''
-      const scheduleLastError = schedule !== null && typeof schedule.lastError === 'string' && schedule.lastError !== ''
-        ? schedule.lastError
-        : ''
-      const scheduleSkippedReason = schedule !== null && typeof schedule.lastSkippedReason === 'string'
-        && schedule.lastSkippedReason !== ''
-        ? schedule.lastSkippedReason
-        : ''
+      const startBlocked = !startReached(timing, clockNow)
 
       const sessionRows = sessions.map((session) => {
         const activeRow = session.retiredAt === null || session.retiredAt === undefined
@@ -6310,14 +6486,17 @@ window.__ModuleLoader__.load({
         })
       })
 
-      const statusButtons = STATUSES.map((status) => h('button', {
-        key: status,
-        type: 'button',
-        title: STATUS_HINTS[status],
-        className: 'dsh-td-seg-btn' + (node.status === status ? ' dsh-td-seg-btn-on' : ''),
-        disabled: props.busy || node.status === status,
-        onClick: () => changeStatus(status),
-      }, statusLabel(status)))
+      const statusButtons = STATUSES.map((status) => {
+        const blockedByStart = status === 'doing' && startBlocked
+        return h('button', {
+          key: status,
+          type: 'button',
+          title: blockedByStart ? '计划开始时间未到，不能切到进行中' : STATUS_HINTS[status],
+          className: 'dsh-td-seg-btn' + (node.status === status ? ' dsh-td-seg-btn-on' : ''),
+          disabled: props.busy || node.status === status || blockedByStart,
+          onClick: () => changeStatus(status),
+        }, statusLabel(status))
+      })
 
       const failWarning = failPrompt
         ? h('div', { className: 'dsh-td-cond dsh-td-cond-off' },
@@ -6410,10 +6589,12 @@ window.__ModuleLoader__.load({
                 style: { height: notesHeight + 'px' },
                 value: notes,
                 placeholder: '背景、约束、完成标准…支持 Markdown，自动保存',
+                title: 'Tab 键插入制表符',
                 onChange: (event) => {
                   setNotes(event.target.value)
                   setDraftValue('notes', event.target.value)
                 },
+                onKeyDown: handleNotesKeyDown,
                 onBlur: () => flushDraft('notes', true),
               }),
             )
@@ -6512,19 +6693,23 @@ window.__ModuleLoader__.load({
           active !== null
             ? h(ContextMeter, { fact: activeFact })
             : h('div', { className: 'dsh-td-hintline' }, '当前没有生效会话。'),
+          startBlocked && timing !== null
+            ? h('div', { className: 'dsh-td-hintline' },
+              '计划开始时间未到（' + formatTime(timing.startAt) + '），在此之前不能创建新会话。')
+            : null,
           h('div', { className: 'dsh-td-toolbar-row' },
             h('button', {
               type: 'button',
               className: 'dsh-td-btn dsh-td-btn-primary',
-              disabled: props.busy,
-              title: '新建会话并发送确定性交接简报，旧会话自动退休',
+              disabled: props.busy || startBlocked,
+              title: startBlocked ? '计划开始时间未到' : '新建会话并发送确定性交接简报，旧会话自动退休',
               onClick: () => act('handoff', { nodeId: node.id, mode: 'brief' }, '已创建新会话并发送交接简报'),
             }, '交接新会话'),
             h('button', {
               type: 'button',
               className: 'dsh-td-btn',
-              disabled: props.busy,
-              title: '只新建空会话并挂接，不发送任何内容',
+              disabled: props.busy || startBlocked,
+              title: startBlocked ? '计划开始时间未到' : '只新建空会话并挂接，不发送任何内容',
               onClick: () => act('handoff', { nodeId: node.id, mode: 'blank' }, '已创建空会话并挂接'),
             }, '交接新会话（空会话）'),
             h('button', {
@@ -6565,84 +6750,123 @@ window.__ModuleLoader__.load({
             }),
           ),
           h('div', { className: 'dsh-td-hintline' },
-            '当前会话立即应用；交接与定时执行新建会话时同样生效。'),
+            '当前会话立即应用；交接新建会话时同样生效。'),
           catalogWarnings.length > 0
             ? h('div', { className: 'dsh-td-errorline' }, catalogWarnings.join('；'))
             : null,
         ),
-        // schedule
+        // timing window: earliest start, per-run limit, absolute deadline
         h(CollapsibleSection, {
-          title: '定时执行',
-          note: scheduleEnabled ? '已启用' : '未启用',
+          title: '时间控制',
+          note: timingActive ? timingNote : '未设置',
           defaultOpen: false,
         },
-          h('label', { className: 'dsh-td-check' },
-            h('input', {
-              type: 'checkbox',
-              checked: scheduleEnabled,
-              disabled: props.busy,
-              onChange: toggleSchedule,
-            }),
-            '按 cron 自动执行',
+          h('div', { className: 'dsh-td-field' },
+            h('span', { className: 'dsh-td-label' }, '最早开始'),
+            h('div', { className: 'dsh-td-toolbar-row' },
+              h('input', {
+                className: 'dsh-td-input dsh-td-grow',
+                type: 'datetime-local',
+                value: startAtDraft,
+                disabled: props.busy,
+                onChange: (event) => {
+                  setStartAtDraft(event.target.value)
+                  markTimingDirty()
+                },
+                onBlur: () => {
+                  if (timingEditRef.current.dirty === true) void saveTiming(false)
+                },
+              }),
+              startAtDraft !== ''
+                ? h('button', {
+                  type: 'button',
+                  className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+                  disabled: props.busy,
+                  onMouseDown: (event) => event.preventDefault(),
+                  onClick: () => clearTimingField('startAt'),
+                }, '清除')
+                : null,
+            ),
+            h('div', { className: 'dsh-td-hintline' },
+              startBlocked
+                ? '还没到计划开始时间；在此之前不能交接新会话，也不能切到「进行中」。'
+                : '留空表示条件满足后即可开始。'),
           ),
-          h('div', { className: 'dsh-td-hintline' },
-            '到期按上述配置新建会话执行；节点非「待开始」或条件未满足时跳过。'),
+          h('div', { className: 'dsh-td-field' },
+            h('span', { className: 'dsh-td-label' }, '单次最长执行（分钟）'),
+            h('div', { className: 'dsh-td-toolbar-row' },
+              h('input', {
+                className: 'dsh-td-input dsh-td-grow',
+                type: 'number',
+                min: 1,
+                max: MAX_RUN_MINUTES,
+                step: 1,
+                value: maxRunDraft,
+                placeholder: '例如 120；留空表示不限制',
+                disabled: props.busy,
+                onChange: (event) => {
+                  setMaxRunDraft(event.target.value)
+                  markTimingDirty()
+                },
+                onBlur: () => {
+                  if (timingEditRef.current.dirty === true) void saveTiming(false)
+                },
+              }),
+              maxRunDraft !== ''
+                ? h('button', {
+                  type: 'button',
+                  className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+                  disabled: props.busy,
+                  onMouseDown: (event) => event.preventDefault(),
+                  onClick: () => clearTimingField('maxRunMinutes'),
+                }, '清除')
+                : null,
+            ),
+            h('div', { className: 'dsh-td-hintline' },
+              '从本轮 Agent 开始执行时计时；到期会取消当前轮次，并把节点退回「待开始」。'),
+          ),
+          h('div', { className: 'dsh-td-field' },
+            h('span', { className: 'dsh-td-label' }, '最晚结束'),
+            h('div', { className: 'dsh-td-toolbar-row' },
+              h('input', {
+                className: 'dsh-td-input dsh-td-grow',
+                type: 'datetime-local',
+                value: deadlineDraft,
+                disabled: props.busy,
+                onChange: (event) => {
+                  setDeadlineDraft(event.target.value)
+                  markTimingDirty()
+                },
+                onBlur: () => {
+                  if (timingEditRef.current.dirty === true) void saveTiming(false)
+                },
+              }),
+              deadlineDraft !== ''
+                ? h('button', {
+                  type: 'button',
+                  className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
+                  disabled: props.busy,
+                  onMouseDown: (event) => event.preventDefault(),
+                  onClick: () => clearTimingField('deadlineAt'),
+                }, '清除')
+                : null,
+            ),
+            h('div', { className: 'dsh-td-hintline' },
+              '到达这个时间点会取消当前轮次；与单次最长执行同时设置时，先到者生效。'),
+          ),
           h('div', { className: 'dsh-td-toolbar-row' },
-            h('input', {
-              className: 'dsh-td-input dsh-td-grow',
-              type: 'text',
-              value: cronDraft,
-              placeholder: '5 段 cron，例如 0 9 * * 1-5',
-              onChange: (event) => {
-                setCronDraft(event.target.value)
-                setDraftValue('cron', event.target.value)
-              },
-              onBlur: () => flushDraft('cron', true),
-              onKeyDown: (event) => {
-                if (event.key === 'Enter') {
-                  event.preventDefault()
-                  saveCron()
-                }
-              },
-            }),
             h('button', {
               type: 'button',
-              className: 'dsh-td-btn dsh-td-btn-sm',
+              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-primary',
               disabled: props.busy,
-              title: '保存 cron 表达式（Host 会重新计算下次执行时间）',
-              onClick: saveCron,
-            }, '保存定时'),
+              onClick: () => { void saveTiming(true) },
+            }, '保存时间设置'),
           ),
-          h('div', { className: 'dsh-td-presets' },
-            CRON_PRESETS.map((preset) => h('button', {
-              key: preset.cron,
-              type: 'button',
-              className: 'dsh-td-btn dsh-td-btn-sm dsh-td-btn-text',
-              disabled: props.busy,
-              title: preset.cron,
-              onClick: () => applyCronPreset(preset.cron),
-            }, preset.label)),
-          ),
-          h('div', { className: 'dsh-td-sched-line' },
-            h('span', null, '下次执行'),
-            h('span', { className: 'dsh-td-sched-value' },
-              scheduleEnabled ? (scheduleNextRun !== '' ? scheduleNextRun : '待计算') : '—'),
-          ),
-          h('div', { className: 'dsh-td-sched-line' },
-            h('span', null, '上次结果'),
-            h('span', { className: 'dsh-td-sched-value' }, scheduleLastResult || '暂无记录'),
-          ),
-          scheduleLastRun !== ''
-            ? h('div', { className: 'dsh-td-sched-line' },
-              h('span', null, '上次执行'),
-              h('span', { className: 'dsh-td-sched-value' }, scheduleLastRun))
+          timingLastTimeout !== ''
+            ? h('div', { className: 'dsh-td-hintline' }, '上次超时：' + timingLastTimeout)
             : null,
-          scheduleSkippedReason !== ''
-            ? h('div', { className: 'dsh-td-hintline' }, '跳过原因：' + scheduleSkippedReason)
-            : null,
-          scheduleLastError !== ''
-            ? h('div', { className: 'dsh-td-errorline' }, '上次错误：' + scheduleLastError)
-            : null,
+          h('div', { className: 'dsh-td-hintline' },
+            '需要按固定时刻自动发起任务时，请使用 DSH 自带的自动化任务；这里只约束这个任务自己的时间窗口。'),
         ),
         // danger zone (collapsed by default)
         h(CollapsibleSection, {
@@ -6854,7 +7078,7 @@ window.__ModuleLoader__.load({
     }
 
     // =======================================================================
-    // 12. Panel page — state ownership, live updates, persistence.
+    // 13. Panel page — state ownership, live updates, persistence.
     // =======================================================================
     function TaskDagPage(props) {
       const ctx = props !== null && props !== undefined && props.ctx !== undefined ? props.ctx : null
@@ -6885,6 +7109,10 @@ window.__ModuleLoader__.load({
       const [catalog, setCatalog] = useState({ phase: 'idle', presets: [], models: [], warnings: [] })
       const [linkDraft, setLinkDraft] = useState(null)
       const [layoutMode, setLayoutMode] = useState(() => readLayoutMode(initial))
+      // `graph` is the editable canvas; `board` shows the same nodes as status
+      // columns. The choice survives remounts like the viewport and widths.
+      const [viewMode, setViewMode] = useState(() => readViewMode(initial))
+      const [openingSource, setOpeningSource] = useState(false)
 
       // Side-column widths. Persisted like the viewport so a remount (the
       // `main` slot unmounts on navigation) keeps the user's layout.
@@ -6893,6 +7121,13 @@ window.__ModuleLoader__.load({
       const [rightWidth, setRightWidth] = useState(initialWidths.right)
 
       const snapshotRef = useRef(null)
+      // One in-flight GET /state per workspace: the mount effect, the board's
+      // explicit ensure step, SSE frames and a visibility return can all ask at
+      // once, and they should share one request rather than race each other.
+      const stateRequestRef = useRef(null)
+      // Board mount is a load entry point of its own: if the persisted view is
+      // the board, the panel must fetch the graph even when no canvas exists.
+      const boardLoadRef = useRef(null)
       const workspaceIdRef = useRef(workspaceId)
       workspaceIdRef.current = workspaceId
       const queueRef = useRef(Promise.resolve())
@@ -7036,6 +7271,10 @@ window.__ModuleLoader__.load({
         writePersisted({ layoutMode })
       }, [layoutMode])
 
+      useEffect(() => {
+        writePersisted({ viewMode })
+      }, [viewMode])
+
       // -- workspace list ---------------------------------------------------
       const loadWorkspaces = useCallback(async () => {
         const result = await requestJson('GET', ENDPOINTS.workspaces)
@@ -7085,34 +7324,46 @@ window.__ModuleLoader__.load({
       }, [ctx])
 
       // -- current snapshot -------------------------------------------------
-      const loadState = useCallback(async (id) => {
-        if (typeof id !== 'string' || id === '') return
-        const result = await requestJson('GET', ENDPOINTS.state + '?workspaceId=' + encodeURIComponent(id))
-        if (workspaceIdRef.current !== id) return
-        if (result.ok !== true) {
-          const message = result.message || '无法加载图谱'
-          if (snapshotRef.current !== null) {
-            showNotice('error', message)
+      const loadState = useCallback((id) => {
+        if (typeof id !== 'string' || id === '') return Promise.resolve()
+        const inflight = stateRequestRef.current
+        if (inflight !== null && inflight.id === id) return inflight.promise
+        const promise = (async () => {
+          const result = await requestJson('GET', ENDPOINTS.state + '?workspaceId=' + encodeURIComponent(id))
+          if (workspaceIdRef.current !== id) return
+          if (result.ok !== true) {
+            const message = result.message || '无法加载图谱'
+            if (snapshotRef.current !== null) {
+              showNotice('error', message)
+              return
+            }
+            setState({ phase: 'error', snapshot: null, error: message })
             return
           }
-          setState({ phase: 'error', snapshot: null, error: message })
-          return
+          const snapshot = result.data !== null && typeof result.data === 'object' ? result.data.snapshot : null
+          if (snapshot === null || typeof snapshot !== 'object') {
+            setState({ phase: 'error', snapshot: null, error: 'Host 返回的快照格式不正确' })
+            return
+          }
+          const incomingRevision = snapshot.graph !== null && typeof snapshot.graph === 'object'
+            ? toCount(snapshot.graph.revision)
+            : 0
+          const currentRevision = snapshotRef.current !== null && snapshotRef.current.graph !== null
+            && typeof snapshotRef.current.graph === 'object'
+            ? toCount(snapshotRef.current.graph.revision)
+            : -1
+          if (incomingRevision < currentRevision) return
+          snapshotRef.current = snapshot
+          setState({ phase: 'ready', snapshot, error: null })
+        })()
+        stateRequestRef.current = { id, promise }
+        const clear = () => {
+          if (stateRequestRef.current !== null && stateRequestRef.current.promise === promise) {
+            stateRequestRef.current = null
+          }
         }
-        const snapshot = result.data !== null && typeof result.data === 'object' ? result.data.snapshot : null
-        if (snapshot === null || typeof snapshot !== 'object') {
-          setState({ phase: 'error', snapshot: null, error: 'Host 返回的快照格式不正确' })
-          return
-        }
-        const incomingRevision = snapshot.graph !== null && typeof snapshot.graph === 'object'
-          ? toCount(snapshot.graph.revision)
-          : 0
-        const currentRevision = snapshotRef.current !== null && snapshotRef.current.graph !== null
-          && typeof snapshotRef.current.graph === 'object'
-          ? toCount(snapshotRef.current.graph.revision)
-          : -1
-        if (incomingRevision < currentRevision) return
-        snapshotRef.current = snapshot
-        setState({ phase: 'ready', snapshot, error: null })
+        promise.then(clear, clear)
+        return promise
       }, [showNotice])
 
       function patchWorkspaceRow(snapshot) {
@@ -7256,6 +7507,25 @@ window.__ModuleLoader__.load({
         setState({ phase: 'loading', snapshot: null, error: null })
         loadState(workspaceId)
       }, [workspaceId, loadState, dropUndoStack])
+
+      // The board view is a first-class entry point: no SVG canvas mounts in
+      // it, so its own mount must ensure the graph is fetched. The workspace
+      // effect above usually starts the same request; loadState() deduplicates
+      // it, so this is one GET either way. A failure stays visible through the
+      // shared overlay instead of leaving an empty board with no clue.
+      useEffect(() => {
+        if (viewMode !== 'board') {
+          boardLoadRef.current = null
+          return
+        }
+        if (snapshotRef.current !== null) return
+        if (state.phase !== 'idle') return
+        const id = workspaceIdRef.current
+        if (typeof id !== 'string' || id === '') return
+        if (boardLoadRef.current === id) return
+        boardLoadRef.current = id
+        loadState(id)
+      }, [viewMode, state.phase, loadState])
 
       useEffect(() => {
         if (workspaces.phase !== 'ready' || workspaces.items.length === 0) return
@@ -7557,7 +7827,7 @@ window.__ModuleLoader__.load({
             position: { x: Math.round(origin.x + dx), y: Math.round(origin.y + dy) },
           }
           // Copy only the node's own settings. Conditions, edges, sessions,
-          // schedule, status and milestone deliberately stay with the original.
+          // timing window, status and milestone deliberately stay with the original.
           for (const key of ['agentPreset', 'model', 'reasoningEffort']) {
             if (typeof source[key] === 'string' && source[key] !== '') payload[key] = source[key]
           }
@@ -7768,6 +8038,36 @@ window.__ModuleLoader__.load({
         }
       }, [layoutMode, model, runAction, showNotice])
 
+      // Switching the middle column never writes the graph; it only flushes the
+      // open editor first so a draft cannot be lost behind the other view.
+      const toggleViewMode = useCallback(() => {
+        flushDrafts()
+        setViewMode((value) => (value === 'board' ? 'graph' : 'board'))
+      }, [flushDrafts])
+
+      const openSourceFolder = useCallback(async () => {
+        const id = workspaceIdRef.current
+        if (typeof id !== 'string' || id === '') {
+          showNotice('warn', '请先在左侧选择一个项目')
+          return
+        }
+        setOpeningSource(true)
+        try {
+          const result = await requestJson('POST', ENDPOINTS.openFolder, { workspaceId: id })
+          if (result.ok === true) {
+            const target = result.data !== null && result.data !== undefined
+              && typeof result.data.path === 'string'
+              ? result.data.path
+              : ''
+            showNotice('info', target === '' ? '已打开源文件夹' : '已打开源文件夹：' + target)
+            return
+          }
+          showNotice('error', result.message || '无法打开源文件夹')
+        } finally {
+          setOpeningSource(false)
+        }
+      }, [showNotice])
+
       const handleAutoLayout = useCallback(async () => {
         const current = snapshotRef.current
         const graph = current !== null && current.graph !== null && typeof current.graph === 'object'
@@ -7845,6 +8145,14 @@ window.__ModuleLoader__.load({
               '里程碑：' + milestoneNode.title + (milestoneNode.status === 'done' ? ' ✓' : ''))
             : null,
         ),
+        h('button', {
+          type: 'button',
+          className: 'dsh-td-btn dsh-td-btn-sm',
+          title: viewMode === 'board'
+            ? '回到可拖动的任务图谱'
+            : '把中间区域切换为按状态分列的任务看板',
+          onClick: toggleViewMode,
+        }, viewMode === 'board' ? '切换图谱视图' : '切换看板视图'),
         model.notes.length > 0
           ? h(Chip, { kind: 'muted', title: model.notes.join('\n') }, '提示 ' + String(model.notes.length))
           : null,
@@ -7853,6 +8161,13 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-td-live-dot' + (live ? ' dsh-td-live-dot-on' : '') }),
           live ? '实时同步' : '未连接',
         ),
+        h('button', {
+          type: 'button',
+          className: 'dsh-td-btn dsh-td-btn-sm',
+          title: '在文件资源管理器中打开本项目的任务图文件夹（.dsh-task-graph）',
+          onClick: openSourceFolder,
+          disabled: workspaceId === null || openingSource,
+        }, openingSource ? '打开中…' : '打开源文件'),
         h('button', {
           type: 'button',
           className: 'dsh-td-btn dsh-td-btn-sm',
@@ -7902,10 +8217,16 @@ window.__ModuleLoader__.load({
           onClick: () => loadState(workspaceId),
         })
       } else if (state.phase === 'ready' && model.nodes.length === 0) {
-        overlay = overlayCard('还没有任务节点', '双击画布空白处新建第一个节点，或点击左上角「新建节点」。', {
-          label: '新建节点',
-          onClick: () => handleCreateNode(null),
-        })
+        overlay = overlayCard(
+          '还没有任务节点',
+          viewMode === 'board'
+            ? '看板会按状态显示全部任务；先新建一个节点，它就会出现。'
+            : '双击画布空白处新建第一个节点，或点击左上角「新建节点」。',
+          {
+            label: '新建节点',
+            onClick: () => handleCreateNode(null),
+          },
+        )
       }
 
       return h('div', { className: 'dsh-td-root' },
@@ -7943,33 +8264,39 @@ window.__ModuleLoader__.load({
             onStep: (delta) => stepColumnWidth('left', delta),
           }),
           h('div', { className: 'dsh-td-main' + (notice !== null ? ' dsh-td-main-notice' : '') },
-            h(GraphCanvas, {
-              model,
-              workspaceKey: workspaceId,
-              selectedNodeId,
-              selectedNodeIds,
-              selectedEdgeId,
-              selectedGroupId,
-              layoutMode,
-              onToggleLayoutMode: toggleLayoutMode,
-              onSelectNode: handleSelectNode,
-              onSelectEdge: handleSelectEdge,
-              onSelectGroup: handleSelectGroup,
-              onRenameGroup: handleRenameGroup,
-              onDeleteGroup: handleDeleteGroup,
-              onMoveNode: handleMoveNode,
-              onCreateNode: handleCreateNode,
-              onRequestLink: handleRequestLink,
-              onDeleteEdge: handleDeleteEdge,
-              onAutoLayout: handleAutoLayout,
-              onSelectMany: handleSelectMany,
-              onDuplicateNodes: handleDuplicateNodes,
-              onRequestDelete: handleRequestDelete,
-              onUndo: handleUndo,
-              canUndo: undoDepth > 0,
-            }),
+            viewMode === 'board'
+              ? h(KanbanBoard, {
+                model,
+                selectedNodeId,
+                onSelectNode: handleSelectNode,
+              })
+              : h(GraphCanvas, {
+                model,
+                workspaceKey: workspaceId,
+                selectedNodeId,
+                selectedNodeIds,
+                selectedEdgeId,
+                selectedGroupId,
+                layoutMode,
+                onToggleLayoutMode: toggleLayoutMode,
+                onSelectNode: handleSelectNode,
+                onSelectEdge: handleSelectEdge,
+                onSelectGroup: handleSelectGroup,
+                onRenameGroup: handleRenameGroup,
+                onDeleteGroup: handleDeleteGroup,
+                onMoveNode: handleMoveNode,
+                onCreateNode: handleCreateNode,
+                onRequestLink: handleRequestLink,
+                onDeleteEdge: handleDeleteEdge,
+                onAutoLayout: handleAutoLayout,
+                onSelectMany: handleSelectMany,
+                onDuplicateNodes: handleDuplicateNodes,
+                onRequestDelete: handleRequestDelete,
+                onUndo: handleUndo,
+                canUndo: undoDepth > 0,
+              }),
             overlay,
-            linkDraft !== null
+            viewMode === 'graph' && linkDraft !== null
               ? h(LinkConditionDialog, {
                 key: 'link:' + linkDraft.from + '→' + linkDraft.to,
                 model,
@@ -7980,7 +8307,7 @@ window.__ModuleLoader__.load({
                 onDone: () => setLinkDraft(null),
               })
               : null,
-            selectionDraft !== null
+            viewMode === 'graph' && selectionDraft !== null
               ? h(SelectionPanel, {
                 key: 'select:' + selectionDraft.nodeIds.join('|'),
                 count: selectionDraft.nodeIds.length,
@@ -7989,7 +8316,7 @@ window.__ModuleLoader__.load({
                 onClose: handleCloseSelectionPanel,
               })
               : null,
-            groupDraft !== null
+            viewMode === 'graph' && groupDraft !== null
               ? h(GroupNameDialog, {
                 key: 'group:' + (groupDraft.mode === 'rename'
                   ? groupDraft.groupId
@@ -8006,7 +8333,7 @@ window.__ModuleLoader__.load({
                 onDone: dropGroupDraft,
               })
               : null,
-            deleteDraft !== null
+            viewMode === 'graph' && deleteDraft !== null
               ? h(DeleteNodesDialog, {
                 key: 'delete:' + deleteDraft.nodeIds.join('|'),
                 titles: deleteDraft.nodeIds.map((nodeId) => {
@@ -8061,7 +8388,7 @@ window.__ModuleLoader__.load({
     }
 
     // =======================================================================
-    // 13. Sidebar icon, error boundary, slot registration
+    // 14. Sidebar icon, error boundary, slot registration
     // =======================================================================
     function TaskDagIcon(props) {
       const size = props !== null && props !== undefined && typeof props.size === 'number' ? props.size : 18

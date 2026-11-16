@@ -12,14 +12,14 @@
  *   - a failed node can never be the source of an edge, and turning a node into
  *     `failed` either refuses (it still has successors) or explicitly detaches
  *     those successors;
- *   - node-level execution targets and schedules are validated here, including
- *     the cron expression and the next run instant;
+ *   - node-level execution targets and timing windows are validated here: the
+ *     earliest start / absolute deadline instants and the per-run minute limit;
  *   - the project milestone has no edge restrictions.
  */
 
 import { CODES, TaskDagError } from './errors.js'
-import { isValidCron, nextRunAtMs } from './cron.js'
 import {
+  MAX_RUN_MINUTES,
   STATUSES,
   activeSession,
   assertInvariants,
@@ -62,7 +62,7 @@ export const SUPPORTED_ACTIONS = Object.freeze([
   'create-group',
   'rename-group',
   'delete-group',
-  'set-schedule',
+  'set-timing',
   'attach-session',
   'switch-session',
   'detach-session',
@@ -79,7 +79,6 @@ const MAX_NOTES_CHARS = 20000
 const MAX_CONDITION_CHARS = 200
 const MAX_TARGET_CHARS = 200
 const MAX_SESSION_TITLE_CHARS = 120
-const MAX_SCHEDULE_ERROR_CHARS = 500
 const MAX_GROUP_NAME_CHARS = 60
 const MIN_GROUP_MEMBERS = 2
 const TAIL_MESSAGES = 12
@@ -102,6 +101,28 @@ function claimed(message, details) {
 
 function sessionMissing(message, details) {
   return new TaskDagError(CODES.sessionNotFound, message, { status: 404, details })
+}
+
+/**
+ * The absolute-start gate. A node with a future `timing.startAt` has been
+ * planned but not released yet; both handoff and an explicit status change to
+ * "doing" must refuse instead of silently starting early.
+ */
+function assertStartReached(node, now = nowIso()) {
+  const startAt = node?.timing?.startAt
+  if (typeof startAt !== 'string' || startAt === '') return
+  const startMs = Date.parse(startAt)
+  if (!Number.isFinite(startMs)) return
+  const nowMs = Date.parse(now)
+  if (!Number.isFinite(nowMs) || startMs <= nowMs) return
+  throw new TaskDagError(
+    CODES.startNotReached,
+    `这个任务计划在 ${startAt} 开始，还没到开始时间。`,
+    {
+      status: 409,
+      details: { nodeId: node.id, startAt },
+    },
+  )
 }
 
 /** Fail early and readably when the host wires the plugin without a store. */
@@ -440,7 +461,7 @@ function addNode(current, payload) {
     agentPreset: agentPreset === undefined ? null : agentPreset,
     model: model === undefined ? null : model,
     reasoningEffort: reasoningEffort === undefined ? null : reasoningEffort,
-    schedule: null,
+    timing: null,
     createdAt: now,
     updatedAt: now,
     completedAt: null,
@@ -521,6 +542,7 @@ function updateNode(current, payload) {
       throw invalidRequest(`状态只能是 ${STATUSES.join('、')}。`, { field: 'status' })
     }
     if (status !== node.status) {
+      if (status === 'doing') assertStartReached(node, now)
       if (status === 'failed') {
         // Invariant: a failed node may not be a prerequisite. Refuse the
         // transition while it still has successors unless the caller opted in
@@ -994,128 +1016,111 @@ function deleteCondition(current, payload) {
   }
 }
 
-function cleanCron(value) {
+/** Normalize a payload instant to ISO, or null. Empty strings clear the field. */
+function cleanInstant(value, field, label) {
+  if (value === null || value === undefined || value === '') return null
   if (typeof value !== 'string') {
-    throw invalidRequest('定时表达式必须是文字。', { field: 'cron' })
+    throw invalidRequest(`${label}必须是 ISO 时间文字，或用空值清除。`, { field })
   }
-  const cron = value.trim()
-  if (cron !== '' && !isValidCron(cron)) {
-    throw invalidRequest('定时表达式不合法，需要 5 段：分 时 日 月 周。', { field: 'cron' })
+  const ms = Date.parse(value)
+  if (!Number.isFinite(ms)) {
+    throw invalidRequest(`${label}不是合法时间。`, { field })
   }
-  return cron
+  return new Date(ms).toISOString()
 }
 
-function setSchedule(current, payload, now = nowIso()) {
+function cleanRunMinutes(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    throw invalidRequest('最长执行时长必须是分钟数，或用空值清除。', { field: 'maxRunMinutes' })
+  }
+  const minutes = Math.floor(number)
+  if (minutes < 1 || minutes > MAX_RUN_MINUTES) {
+    throw invalidRequest(`最长执行时长必须在 1–${MAX_RUN_MINUTES} 分钟之间。`, {
+      field: 'maxRunMinutes',
+      maxRunMinutes: MAX_RUN_MINUTES,
+    })
+  }
+  return minutes
+}
+
+function setTiming(current, payload, now = nowIso()) {
   const next = cloneGraph(current)
   const node = requireNode(next, payload.nodeId)
-  const existing = node.schedule
-  const schedule = {
-    enabled: existing?.enabled === true,
-    cron: existing?.cron ?? '',
-    nextRunAt: existing?.nextRunAt ?? null,
-    lastTriggeredAt: existing?.lastTriggeredAt ?? null,
-    lastFinishedAt: existing?.lastFinishedAt ?? null,
-    lastResult: existing?.lastResult ?? null,
-    lastError: existing?.lastError ?? null,
-    lastSkippedReason: existing?.lastSkippedReason ?? null,
-    lastSessionId: existing?.lastSessionId ?? null,
+  const existing = node.timing
+  const timing = {
+    startAt: existing?.startAt ?? null,
+    deadlineAt: existing?.deadlineAt ?? null,
+    maxRunMinutes: existing?.maxRunMinutes ?? null,
+    lastTimeoutAt: existing?.lastTimeoutAt ?? null,
+    lastTimeoutReason: existing?.lastTimeoutReason ?? null,
+  }
+  if (payload.startAt !== undefined) timing.startAt = cleanInstant(payload.startAt, 'startAt', '最早开始时间')
+  if (payload.deadlineAt !== undefined) timing.deadlineAt = cleanInstant(payload.deadlineAt, 'deadlineAt', '最晚结束时间')
+  if (payload.maxRunMinutes !== undefined) timing.maxRunMinutes = cleanRunMinutes(payload.maxRunMinutes)
+
+  if (timing.startAt !== null && timing.deadlineAt !== null
+    && Date.parse(timing.deadlineAt) <= Date.parse(timing.startAt)) {
+    throw invalidRequest('最晚结束时间必须晚于最早开始时间。', { field: 'deadlineAt' })
   }
 
-  if (payload.cron !== undefined) schedule.cron = cleanCron(payload.cron)
-  if (payload.enabled !== undefined) {
-    if (typeof payload.enabled !== 'boolean') {
-      throw invalidRequest('定时开关必须是 true 或 false。', { field: 'enabled' })
-    }
-    schedule.enabled = payload.enabled
-  }
-
-  if (schedule.enabled) {
-    if (schedule.cron === '') {
-      throw invalidRequest('开启定时执行前请先填写定时表达式。', { field: 'cron' })
-    }
-    const nextMs = nextRunAtMs(schedule.cron, Date.parse(now))
-    if (nextMs === undefined) {
-      throw invalidRequest('这个定时表达式永远不会触发，请换一个。', { field: 'cron' })
-    }
-    schedule.nextRunAt = new Date(nextMs).toISOString()
-  } else {
-    schedule.nextRunAt = null
-  }
-
-  node.schedule = schedule
+  const empty = timing.startAt === null && timing.deadlineAt === null && timing.maxRunMinutes === null
+  node.timing = empty ? null : timing
   node.updatedAt = now
   return {
     next,
-    event: { type: 'schedule/set', data: { nodeId: node.id, schedule } },
-    result: { nodeId: node.id, schedule },
+    event: { type: 'timing/set', data: { nodeId: node.id, timing: node.timing } },
+    result: { nodeId: node.id, timing: node.timing },
   }
 }
 
-/* ------------------------------------------------------------------ */
-/* execution settlement (shared with the scheduler)                    */
-/* ------------------------------------------------------------------ */
-
 /**
- * Settle a scheduled/manual execution against the node it ran for.
- *
- * Only applies while the node is still `doing` and the recorded session is the
- * node's current session, so a human edit made during the run always wins.
- * A failed execution detaches the node's outgoing edges because a failed node
- * may never remain a prerequisite.
- *
- * @returns {{next: object, event: object|undefined, result: object}|null}
+ * The timing watcher's single write: a run that outlived its window is paused
+ * by cancelling the turn, then the node returns to "todo" with the session chain
+ * untouched, so the user can resume from the same conversation.
  */
-export function applyExecutionOutcome(current, options = {}) {
+export function markTimingTimeout(current, options = {}) {
   const nodeId = requireNodeId(options.nodeId)
-  const outcome = options.outcome
-  if (outcome !== 'succeeded' && outcome !== 'failed' && outcome !== 'cancelled') {
-    throw invalidRequest('执行结果只能是 succeeded、failed 或 cancelled。', { field: 'outcome' })
+  const reason = options.reason
+  if (reason !== 'run-limit' && reason !== 'deadline') {
+    throw invalidRequest('超时原因只能是 run-limit 或 deadline。', { field: 'reason' })
   }
+  const now = typeof options.now === 'string' && options.now !== '' ? options.now : nowIso()
   const next = cloneGraph(current)
   const node = findNode(next, nodeId)
-  if (node === undefined) return null
-
+  if (node === undefined) {
+    throw new TaskDagError(CODES.notFound, '这个任务已经不在图里。', {
+      status: 404,
+      details: { nodeId },
+    })
+  }
   if (node.status !== 'doing') {
-    return { next: current, event: undefined, result: { applied: false, reason: 'not-doing', outcome } }
+    return { next: current, event: undefined, result: { applied: false, reason: 'not-doing', nodeId } }
   }
-  const currentSessionId = activeSession(node)?.sessionId
-  const sessionId = typeof options.sessionId === 'string' ? options.sessionId : ''
-  if (sessionId !== '' && currentSessionId !== undefined && currentSessionId !== sessionId) {
-    return { next: current, event: undefined, result: { applied: false, reason: 'session-changed', outcome } }
+  if (node.timing === null || node.timing === undefined) {
+    return { next: current, event: undefined, result: { applied: false, reason: 'no-timing', nodeId } }
   }
-
-  const now = typeof options.now === 'string' && options.now !== '' ? options.now : nowIso()
-  let detachedEdges = []
-  if (outcome === 'succeeded') {
-    node.status = 'done'
-    node.completedAt = now
-    node.failedAt = null
-  } else if (outcome === 'failed') {
-    const outgoing = next.edges.filter((edge) => edge.from === node.id)
-    const detachedIds = new Set(outgoing.map((edge) => edge.id))
-    if (outgoing.length > 0) next.edges = next.edges.filter((edge) => !detachedIds.has(edge.id))
-    detachedEdges = outgoing.map((edge) => ({ id: edge.id, to: edge.to, conditionId: edge.conditionId }))
-    node.status = 'failed'
-    node.failedAt = now
-    node.completedAt = null
-  } else {
-    return { next: current, event: undefined, result: { applied: false, reason: 'cancelled', outcome } }
+  node.status = 'todo'
+  node.completedAt = null
+  node.failedAt = null
+  node.timing = {
+    ...node.timing,
+    lastTimeoutAt: now,
+    lastTimeoutReason: reason,
   }
   node.updatedAt = now
-
   return {
     next,
     event: {
-      type: 'node/execution',
+      type: 'timing/timeout',
       data: {
-        nodeId: node.id,
-        outcome,
-        sessionId: sessionId === '' ? null : sessionId,
-        error: typeof options.error === 'string' ? options.error.slice(0, MAX_SCHEDULE_ERROR_CHARS) : null,
-        detachedEdges,
+        nodeId,
+        reason,
+        sessionId: typeof options.sessionId === 'string' ? options.sessionId : null,
       },
     },
-    result: { applied: true, outcome, nodeId: node.id, detachedEdges },
+    result: { applied: true, nodeId, reason, sessionId: options.sessionId ?? null },
   }
 }
 
@@ -1262,6 +1267,11 @@ function applyHandoff(current, { nodeId, sessionId, mode, briefText }) {
   }
 
   const now = nowIso()
+  // A handoff is also the moment work starts: a node that had never been given
+  // a session and is still waiting to start moves to "doing" together with the
+  // new session. Nodes that already ran (any session in the chain) or that a
+  // human already moved to another state keep their status.
+  const startsWork = node.sessions.length === 0 && node.status === 'todo'
   const previous = retireActiveSession(node, now)
   const record = {
     sessionId,
@@ -1272,6 +1282,11 @@ function applyHandoff(current, { nodeId, sessionId, mode, briefText }) {
     handoff: { from: previous?.sessionId ?? null, mode },
   }
   node.sessions.push(record)
+  if (startsWork) {
+    node.status = 'doing'
+    node.completedAt = null
+    node.failedAt = null
+  }
   node.updatedAt = now
 
   return {
@@ -1285,6 +1300,7 @@ function applyHandoff(current, { nodeId, sessionId, mode, briefText }) {
         mode,
         slot: record.slot,
         brief: typeof briefText === 'string' ? briefText : null,
+        ...(startsWork ? { status: node.status } : {}),
       },
     },
     result: {
@@ -1293,6 +1309,8 @@ function applyHandoff(current, { nodeId, sessionId, mode, briefText }) {
       slot: record.slot,
       previousSessionId: previous?.sessionId ?? null,
       session: record,
+      status: node.status,
+      statusChanged: startsWork,
     },
   }
 }
@@ -1440,6 +1458,7 @@ async function runHandoff(ctx, store, workspace, request, payload) {
 
   const before = readGraph(store, workspace)
   const nodeBefore = requireNode(before, nodeId)
+  assertStartReached(nodeBefore)
   const previous = activeSession(nodeBefore)
   const revision = resolveRevision(store, workspace, request.expectedRevision)
 
@@ -1507,6 +1526,8 @@ async function runHandoff(ctx, store, workspace, request, payload) {
       mode,
       previousSessionId: handoffResult.previousSessionId,
       slot: handoffResult.slot,
+      status: handoffResult.status,
+      statusChanged: handoffResult.statusChanged === true,
       renamed,
       brief: brief === null ? null : brief.text,
       briefTokens: brief === null ? null : brief.tokens,
@@ -1638,9 +1659,9 @@ export async function applyAction(ctx, store, workspace, request) {
       return runMutation(store, workspace, request.expectedRevision,
         (current) => deleteGroup(current, payload))
 
-    case 'set-schedule':
+    case 'set-timing':
       return runMutation(store, workspace, request.expectedRevision,
-        (current) => setSchedule(current, payload))
+        (current) => setTiming(current, payload))
 
     case 'attach-session':
       return runAttachSession(ctx, store, workspace, request, payload)

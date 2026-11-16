@@ -13,14 +13,15 @@
  *   - node *groups*: an optional visual grouping of nodes (at least two at
  *     creation time); a node belongs to at most one group, and a group carries
  *     no ordering semantics;
- *   - per-node execution target (`agentPreset` / `model`) and schedule.
+ *   - per-node execution target (`agentPreset` / `model`) and a time window
+ *     (`timing`: earliest start, per-run limit, absolute deadline).
  *
  * Everything stored is the graph itself. "Can this task start?" is derived on
  * every read from conditions + statuses; a stored readiness flag would drift as
  * soon as one write path forgot to maintain it.
  *
  * This module imports only the shared error type so it stays usable anywhere,
- * including the browser test fixtures and the scheduler's pure helpers.
+ * including the browser test fixtures and the timing watcher's pure helpers.
  */
 import { CODES, TaskDagError } from './errors.js'
 
@@ -41,7 +42,9 @@ export const SCHEMA_VERSION = 2
 
 const LEGACY_SCHEMA_VERSION = 1
 const HANDOFF_MODES = ['manual', 'brief', 'blank', 'attach', 'scheduled']
-const SCHEDULE_RESULTS = ['succeeded', 'failed', 'skipped']
+const TIMEOUT_REASONS = ['run-limit', 'deadline']
+/** Upper bound of one run limit: a week. */
+export const MAX_RUN_MINUTES = 10080
 const UNTITLED = '未命名任务'
 const UNTITLED_CONDITION = '前置条件'
 const UNTITLED_GROUP = '未命名组合'
@@ -174,26 +177,24 @@ function appendCondition(node, title, wantedId) {
 }
 
 /* ------------------------------------------------------------------ */
-/* schedule                                                            */
+/* timing                                                              */
 /* ------------------------------------------------------------------ */
 
-function normalizeSchedule(raw) {
+function positiveIntOrNull(value, max) {
+  const number = Number(value)
+  if (!Number.isFinite(number) || number <= 0) return null
+  return Math.min(Math.floor(number), max)
+}
+
+function normalizeTiming(raw) {
   if (!isRecord(raw)) return null
-  const cron = nonEmptyText(raw.cron)
-  const lastResult = SCHEDULE_RESULTS.includes(raw.lastResult) ? raw.lastResult : null
-  return {
-    // An enabled schedule without a cron expression is meaningless; keep the
-    // record but disarm it so the repair cannot create an always-due node.
-    enabled: raw.enabled === true && cron !== '',
-    cron,
-    nextRunAt: isoOrNull(raw.nextRunAt),
-    lastTriggeredAt: isoOrNull(raw.lastTriggeredAt),
-    lastFinishedAt: isoOrNull(raw.lastFinishedAt),
-    lastResult,
-    lastError: nonEmptyText(raw.lastError) || null,
-    lastSkippedReason: nonEmptyText(raw.lastSkippedReason) || null,
-    lastSessionId: nonEmptyText(raw.lastSessionId) || null,
-  }
+  const startAt = isoOrNull(raw.startAt)
+  const deadlineAt = isoOrNull(raw.deadlineAt)
+  const maxRunMinutes = positiveIntOrNull(raw.maxRunMinutes, MAX_RUN_MINUTES)
+  const lastTimeoutReason = TIMEOUT_REASONS.includes(raw.lastTimeoutReason) ? raw.lastTimeoutReason : null
+  const lastTimeoutAt = lastTimeoutReason === null ? null : isoOrNull(raw.lastTimeoutAt)
+  if (startAt === null && deadlineAt === null && maxRunMinutes === null && lastTimeoutReason === null) return null
+  return { startAt, deadlineAt, maxRunMinutes, lastTimeoutAt, lastTimeoutReason }
 }
 
 /* ------------------------------------------------------------------ */
@@ -269,7 +270,7 @@ function normalizeNode(raw, id, seenSessionIds, migrating) {
     agentPreset: normalizeOptionalId(raw.agentPreset),
     model: normalizeOptionalId(raw.model),
     reasoningEffort: normalizeOptionalId(raw.reasoningEffort),
-    schedule: migrating ? null : normalizeSchedule(raw.schedule),
+    timing: migrating ? null : normalizeTiming(raw.timing),
     createdAt,
     updatedAt,
     // Invariant 4: completedAt / failedAt are the single carriers of the
@@ -1084,29 +1085,30 @@ function assertConditionInvariants(node) {
   }
 }
 
-function assertScheduleInvariants(node) {
-  const schedule = node.schedule
-  if (schedule === null || schedule === undefined) return
-  if (!isRecord(schedule)) {
-    throw invariantError(`节点 ${node.id} 的 schedule 必须是对象或 null。`, { nodeId: node.id })
+function assertTimingInvariants(node) {
+  const timing = node.timing
+  if (timing === null || timing === undefined) return
+  if (!isRecord(timing)) {
+    throw invariantError(`节点 ${node.id} 的 timing 必须是对象或 null。`, { nodeId: node.id })
   }
-  if (typeof schedule.enabled !== 'boolean') {
-    throw invariantError(`节点 ${node.id} 的定时开关必须是布尔值。`, { nodeId: node.id })
-  }
-  if (typeof schedule.cron !== 'string') {
-    throw invariantError(`节点 ${node.id} 的定时表达式必须是字符串。`, { nodeId: node.id })
-  }
-  for (const field of ['nextRunAt', 'lastTriggeredAt', 'lastFinishedAt']) {
-    const value = schedule[field]
+  for (const field of ['startAt', 'deadlineAt', 'lastTimeoutAt']) {
+    const value = timing[field]
     if (value !== null && value !== undefined && !isIsoTimestamp(value)) {
       throw invariantError(`节点 ${node.id} 的 ${field} 不是合法时间。`, { nodeId: node.id, field })
     }
   }
-  if (schedule.lastResult !== null && schedule.lastResult !== undefined
-    && !SCHEDULE_RESULTS.includes(schedule.lastResult)) {
-    throw invariantError(`节点 ${node.id} 的定时结果非法：${String(schedule.lastResult)}。`, {
+  if (timing.maxRunMinutes !== null && timing.maxRunMinutes !== undefined
+    && (!Number.isInteger(timing.maxRunMinutes) || timing.maxRunMinutes <= 0 || timing.maxRunMinutes > MAX_RUN_MINUTES)) {
+    throw invariantError(`节点 ${node.id} 的 maxRunMinutes 必须是 1–${MAX_RUN_MINUTES} 的整数。`, {
       nodeId: node.id,
-      lastResult: schedule.lastResult,
+      maxRunMinutes: timing.maxRunMinutes,
+    })
+  }
+  if (timing.lastTimeoutReason !== null && timing.lastTimeoutReason !== undefined
+    && !TIMEOUT_REASONS.includes(timing.lastTimeoutReason)) {
+    throw invariantError(`节点 ${node.id} 的超时原因非法：${String(timing.lastTimeoutReason)}。`, {
+      nodeId: node.id,
+      lastTimeoutReason: timing.lastTimeoutReason,
     })
   }
 }
@@ -1168,7 +1170,7 @@ export function assertInvariants(graph) {
     assertOptionalTarget(node, 'model')
     assertOptionalTarget(node, 'reasoningEffort')
     assertConditionInvariants(node)
-    assertScheduleInvariants(node)
+    assertTimingInvariants(node)
     assertSessionInvariants(node)
   }
 

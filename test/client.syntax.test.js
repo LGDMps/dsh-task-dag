@@ -36,7 +36,7 @@ const CONTRACT_ACTIONS = [
   'add-condition',
   'update-condition',
   'delete-condition',
-  'set-schedule',
+  'set-timing',
   'attach-session',
   'switch-session',
   'detach-session',
@@ -108,6 +108,7 @@ test('uses only the documented Host endpoints and posts the contract actions', (
   assert.ok(source.includes("API + '/action'"), 'action endpoint')
   assert.ok(source.includes("API + '/events'"), 'SSE endpoint')
   assert.ok(source.includes("API + '/catalog'"), 'catalog endpoint')
+  assert.ok(source.includes("API + '/open-folder'"), 'open-folder endpoint')
   assert.match(source, /credentials:\s*'same-origin'/)
   assert.match(source, /new EventSource\(/)
   assert.match(source, /\?workspaceId=/)
@@ -117,7 +118,7 @@ test('uses only the documented Host endpoints and posts the contract actions', (
     assert.ok(source.includes("'" + action + "'"), 'missing action: ' + action)
   }
   assert.equal(source.includes("'set-closeout'"), false, 'the v2 client uses set-milestone')
-  for (const field of ['conditionId', 'conditionTitle', 'detachSuccessors', 'agentPreset', 'model', 'nextRunAt']) {
+  for (const field of ['conditionId', 'conditionTitle', 'detachSuccessors', 'agentPreset', 'model', 'maxRunMinutes', 'deadlineAt', 'startAt']) {
     assert.ok(source.includes(field), 'missing v2 payload field: ' + field)
   }
   assert.match(source, /onmessage/)
@@ -146,7 +147,7 @@ test('models five statuses with the task-board status colours', () => {
   assert.ok(source.includes('不能作为其他节点的前序'))
 })
 
-test('renders the v2 surface: conditions, link chooser, settings, schedule, milestone', () => {
+test('renders the v2 surface: conditions, link chooser, settings, timing, milestone', () => {
   // condition CRUD and the link flow
   assert.match(source, /function LinkConditionDialog\(props\)/)
   assert.match(source, /选择前置条件/)
@@ -168,15 +169,17 @@ test('renders the v2 surface: conditions, link chooser, settings, schedule, mile
   assert.ok(source.includes('reasoningEffort: nextEffort'))
   assert.ok(source.includes('已保存模型与推理强度'))
 
-  // schedule
-  assert.match(source, /定时执行/)
-  assert.match(source, /const CRON_PRESETS = \[/)
-  assert.ok(source.includes("'0 9 * * 1-5'"), 'the weekday cron preset')
-  assert.ok(source.includes("act('set-schedule'"))
-  assert.match(source, /下次执行/)
-  assert.match(source, /上次结果/)
-  assert.match(source, /lastError/)
-  assert.match(source, /lastSkippedReason/)
+  // timing window
+  assert.match(source, /时间控制/)
+  assert.match(source, /最早开始/)
+  assert.match(source, /单次最长执行（分钟）/)
+  assert.match(source, /最晚结束/)
+  assert.ok(source.includes("act('set-timing'") || source.includes("props.act('set-timing'"))
+  assert.ok(source.includes('saveTiming'))
+  assert.ok(source.includes('startReached'))
+  assert.match(source, /取消当前轮次/)
+  assert.equal(source.includes('CRON_PRESETS'), false, 'cron presets are removed')
+  assert.equal(source.includes('set-schedule'), false, 'the cron action is removed')
 
   // milestone
   assert.ok(source.includes("act('set-milestone'"))
@@ -368,10 +371,11 @@ test('renders the M1 surface: canvas, node detail, session chain, icon props', (
     '已满足',
     '未满足',
     '执行设置',
-    '定时执行',
-    '保存定时',
-    '下次执行',
-    '上次结果',
+    '时间控制',
+    '保存时间设置',
+    '最早开始',
+    '单次最长执行（分钟）',
+    '最晚结束',
     '项目里程碑',
   ]
   for (const text of visibleText) {
@@ -611,4 +615,36 @@ test('restores only its own panel after a bundle reload and opens sessions only 
   assert.equal(occurrences(/ui\.openSession\(/g), 1, 'exactly one openSession call site')
   assert.match(source, /onOpen: \(sessionId\) => props\.onOpenSession\(sessionId\)/)
   assert.match(source, /onClick: \(\) => props\.onOpen\(session\.sessionId\)/)
+})
+
+test('board view, source-folder opening and the description Tab stop are wired', () => {
+  // The graph/board switch lives in the header beside the progress summary.
+  assert.match(source, /function KanbanBoard\(props\)/)
+  assert.match(source, /dsh-td-board-columns/)
+  assert.match(source, /切换看板视图/)
+  assert.match(source, /切换图谱视图/)
+  assert.match(source, /readViewMode/)
+  assert.match(source, /viewMode === 'board'/)
+  assert.ok(source.includes('writePersisted({ viewMode })'), 'the chosen view survives a remount')
+  assert.equal(occurrences(/function KanbanBoard\(props\)/g), 1)
+  // The board is a load entry point too: mounting straight into it fetches the
+  // graph, shares the in-flight request, and keeps the shared error/retry face.
+  assert.match(source, /const stateRequestRef = useRef\(null\)/)
+  assert.match(source, /const boardLoadRef = useRef\(null\)/)
+  assert.match(source, /state\.phase !== 'idle'/)
+  assert.match(source, /if \(viewMode !== 'board'\)/)
+  // A board card is only a shortcut into the existing node drawer.
+  assert.match(source, /onSelectNode: handleSelectNode/)
+
+  // The open-folder action goes through a dedicated loopback-only route.
+  assert.match(source, /openFolder: API \+ '\/open-folder'/)
+  assert.match(source, /ENDPOINTS\.openFolder/)
+  assert.match(source, /const openSourceFolder = useCallback/)
+  assert.ok(source.includes('打开源文件'))
+
+  // Tab in the task description inserts a literal tab and keeps the caret.
+  assert.match(source, /function insertNotesTab\(\)/)
+  assert.match(source, /event\.key !== 'Tab'/)
+  assert.match(source, /onKeyDown: handleNotesKeyDown/)
+  assert.match(source, /Tab 键插入制表符/)
 })

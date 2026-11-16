@@ -16,6 +16,7 @@ export const CODES = {
   forbidden: 'forbidden',
   sessionNotFound: 'session-not-found',
   sessionClaimed: 'session-claimed',
+  startNotReached: 'start-not-reached',
   unsupportedVersion: 'unsupported-version',
   hostUnavailable: 'host-unavailable',
 }

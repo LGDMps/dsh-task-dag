@@ -602,7 +602,7 @@ function rawEventsOf(records, limit) {
 /**
  * Read the last few *events* of one session, keeping control events too.
  *
- * `readTail` answers "what did the agent and the user say"; the scheduler needs
+ * `readTail` answers "what did the agent and the user say"; the timing watcher needs
  * the opposite: the last `turn/end` (including `reason.kind === 'error'`), which
  * the message filter would drop. Same two-tier strategy as `readTail` (live log
  * first, `session/follow` opening snapshot second) and the same no-throw rule.
@@ -727,8 +727,7 @@ function extractText(value, depth, seen) {
 }
 
 /**
- * Render the task-description section shared by the handoff brief and the
- * scheduled-execution brief.
+ * Render the task-description section used by the handoff brief.
  *
  * The description is user-authored Markdown, so it gets its own section instead
  * of being embedded in a list item: a heading, list or code fence inside it must
@@ -1244,6 +1243,16 @@ export async function promptSession(ctx, sessionId, text) {
       content: [{ type: 'text', text: body }],
     },
   })
+}
+
+/**
+ * Cancel the active Agent turn of one session. The pending inbox and the
+ * session log are untouched, so the conversation can be resumed later.
+ */
+export async function cancelSession(ctx, sessionId) {
+  const id = requireSessionId(sessionId)
+  const value = await invoke(ctx, 'session', 'cancel', { request: { sessionId: id } })
+  return value !== null && typeof value === 'object' ? value : { accepted: true }
 }
 
 /** Archive one session (stopActivity by default). Throws TaskDagError on failure. */
